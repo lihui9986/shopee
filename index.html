@@ -176,28 +176,18 @@ img{display:block;max-width:100%}
 </footer>
 
 <script>
-// 模擬商品數據
+// 真實商品數據（從服務器數據庫導出）
 const products = [
-  {name:"全真皮簡約實用零錢包 薄款卡片包",price:299,orig:599,sold:1200,rating:4.9,badge:"shop"},
-  {name:"頭層牛皮斜背包 超輕多隔層 肩背包女",price:680,orig:1280,sold:856,rating:4.8},
-  {name:"泰國設計師包包 簡約大容量側背包",price:1280,orig:2280,sold:432,rating:5.0,badge:"official"},
-  {name:"經典W純色包 摺疊肩背包 真皮背帶",price:980,orig:1680,sold:389,rating:4.7},
-  {name:"牛角包 度假包包 大容量側背包iPad包",price:450,orig:890,sold:2300,rating:4.9},
-  {name:"TOGO牛皮水桶包 肩背包 斜背包",price:1580,orig:2580,sold:156,rating:4.8},
-  {name:"粒面牛皮手提包 小提包 肩背包女",price:880,orig:1580,sold:678,rating:4.6},
-  {name:"薄長夾多卡層 全真皮錢包 編號2046",price:350,orig:680,sold:920,rating:4.9},
-  {name:"電腦包14吋 頭層牛皮 手提包 筆電包",price:780,orig:1380,sold:445,rating:4.7},
-  {name:"三折錢包 短版零錢包 壓花果紋",price:199,orig:399,sold:3100,rating:4.8},
-  {name:"帆布托特包 大容量 學生書包 通勤包",price:259,orig:499,sold:5600,rating:4.9},
-  {name:"鏈條小包 斜挎包 約會包 小方包",price:420,orig:799,sold:789,rating:4.5},
-  {name:"尼龍後背包 防潑水 旅行雙肩包",price:560,orig:980,sold:342,rating:4.6,badge:"shop"},
-  {name:"手拿包晚宴包 鑽石紋 派對手拿包",price:320,orig:650,sold:188,rating:4.7},
-  {name:"相機包 單肩包 復古牛皮 文藝小包",price:690,orig:1280,sold:267,rating:4.8},
-  {name:"腰包胸包 斜挎手機包 運動小包",price:189,orig:359,sold:8900,rating:4.9},
-  {name:"大容量購物袋 折疊環保袋 便攜包",price:99,orig:199,sold:12000,rating:4.8},
-  {name:"鱷魚紋托特包 上班族包 大容量筆電包",price:720,orig:1280,sold:156,rating:4.5},
-  {name:"果凍包透明包 沙灘包 防水游泳包",price:159,orig:299,sold:670,rating:4.6},
-  {name:"毛絨絨小包 可愛動物包 兒童女生包",price:129,orig:259,sold:3400,rating:4.9},
+  {name:"包包軎❤全真皮簡約實用零錢包❤",price:299,orig:599,sold:1000,rating:5.0,badge:"shop",img:"https://down-tw.img.susercontent.com/file/tw-11134207-7rask-m3t1fb89ayxjfb"},
+  {name:"經典設計｜Pavi studio 泰國新銳設計師.時尚W純色包.簡約設計.大容量.真皮背帶.摺疊肩背包.100%總代理",price:1980,orig:2880,sold:1000,rating:5.0,badge:"official",img:"https://down-tw.img.susercontent.com/file/tw-11134207-81ztg-mhrffmpvk7wlab"},
+  {name:"包包軎❤全真皮H多卡層薄長夾❤編號2046",price:450,orig:790,sold:895,rating:4.9,img:"https://down-tw.img.susercontent.com/file/b0898747199acb6e21bc3bc0c61adf22"},
+  {name:"🔥視拍🔥頭層牛皮電腦包14吋牛皮手提包 肩背包女 出國側背包 包包大容量 ipad包 小提包 通勤包包",price:1659,orig:2580,sold:602,rating:5.0,img:"https://down-tw.img.susercontent.com/file/tw-11134207-7rasc-m4vzrwzzf9al22"},
+  {name:"Smile Kids 兒童秋冬睡衣 台灣出貨 德絨 兒童睡衣 保暖內衣 兒童居家服 睡衣兒童 兒童家居服 小孩睡衣",price:298,orig:498,sold:566,rating:4.9,img:"https://down-tw.img.susercontent.com/file/tw-11134207-820lb-moryb4wtk17273"},
+  {name:"🔥特惠🔥視拍 23cm 進口義大利牛皮斜背包女400g 超輕多隔層 肩背包女 斜背包 出國側背包女 背包",price:1169,orig:1880,sold:408,rating:5.0,img:"https://down-tw.img.susercontent.com/file/tw-11134207-7rasa-m1p07o2r7pr1d7"},
+  {name:"🔥視拍 超軟牛角包 度假包包 肩背包女 包包大容量 出國側背包 iPad包 斜背包",price:1431,orig:2180,sold:368,rating:5.0,img:"https://down-tw.img.susercontent.com/file/tw-11134207-81ztd-mh90lu31pqmgcd"},
+  {name:"永恆蓮保濕指緣液指緣硬皮必備Trind 85折好吸收效果強者",price:663,orig:899,sold:319,rating:5.0,img:"https://down-tw.img.susercontent.com/file/184a1d91e12521c1005e1b95cf90b362"},
+  {name:"女童背心 發育內衣 兒童背心 吊帶背心 女童10-15歲內衣裹胸 兒童發育期小背心 莫代爾抹胸",price:244,orig:399,sold:293,rating:4.8,img:"https://down-tw.img.susercontent.com/file/4df569e2c8f09344b4eb858e68903fbb"},
+  {name:"全真皮簡約實用零錢包 薄款卡片包 超薄皮夾",price:299,orig:599,sold:1200,rating:4.9,badge:"shop",img:""},
 ];
 
 const grid = document.getElementById('grid');
@@ -206,10 +196,13 @@ products.forEach((p,i)=>{
   const badge = p.badge === 'official' ? '<span class="official-badge">商城</span>' :
                 p.badge === 'shop' ? '<span class="shop-badge">優選</span>' : '';
   const hue = (i*37)%360;
+  const imgHtml = p.img
+    ? `<img src="${p.img}" loading="lazy" onerror="this.parentElement.innerHTML='<div style=\\'width:100%;height:100%;background:hsl(${hue},40%,85%);display:flex;align-items:center;justify-content:center;font-size:40px\\'>👜</div>'">`
+    : `<div style="width:100%;height:100%;background:hsl(${hue},40%,85%);display:flex;align-items:center;justify-content:center;font-size:40px">👜</div>`;
   grid.innerHTML += `
     <div class="card">
       <div class="card-img">
-        <div style="width:100%;height:100%;background:hsl(${hue},40%,85%);display:flex;align-items:center;justify-content:center;font-size:40px">👜</div>
+        ${imgHtml}
         ${discount>0?`<span class="card-discount">-${discount}%</span>`:''}
       </div>
       <div class="card-body">
