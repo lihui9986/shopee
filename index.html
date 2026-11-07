@@ -150,23 +150,12 @@ img{display:block;max-width:100%}
   <button class="sort-btn">月銷量</button>
   <button class="sort-btn">最新</button>
   <button class="sort-btn">價格</button>
-  <span class="result-count">共 1,234 件商品</span>
+  <span class="result-count" id="count">共 0 件商品</span>
 </div>
 
 <!-- Product Grid -->
 <div class="grid">
   <div class="grid-row" id="grid"></div>
-</div>
-
-<!-- Pagination -->
-<div class="pagination">
-  <div class="page-btn">‹</div>
-  <div class="page-btn active">1</div>
-  <div class="page-btn">2</div>
-  <div class="page-btn">3</div>
-  <div class="page-btn">4</div>
-  <div class="page-btn">5</div>
-  <div class="page-btn">›</div>
 </div>
 
 <!-- Footer -->
@@ -175,30 +164,16 @@ img{display:block;max-width:100%}
   本頁面為靜態模擬，非真實蝦皮網站
 </footer>
 
+<script src="products.js"></script>
 <script>
-// 真實商品數據（從服務器數據庫導出）
-const products = [
-  {name:"包包軎❤全真皮簡約實用零錢包❤",price:299,orig:599,sold:1000,rating:5.0,badge:"shop",img:"https://down-tw.img.susercontent.com/file/tw-11134207-7rask-m3t1fb89ayxjfb"},
-  {name:"經典設計｜Pavi studio 泰國新銳設計師.時尚W純色包.簡約設計.大容量.真皮背帶.摺疊肩背包.100%總代理",price:1980,orig:2880,sold:1000,rating:5.0,badge:"official",img:"https://down-tw.img.susercontent.com/file/tw-11134207-81ztg-mhrffmpvk7wlab"},
-  {name:"包包軎❤全真皮H多卡層薄長夾❤編號2046",price:450,orig:790,sold:895,rating:4.9,img:"https://down-tw.img.susercontent.com/file/b0898747199acb6e21bc3bc0c61adf22"},
-  {name:"🔥視拍🔥頭層牛皮電腦包14吋牛皮手提包 肩背包女 出國側背包 包包大容量 ipad包 小提包 通勤包包",price:1659,orig:2580,sold:602,rating:5.0,img:"https://down-tw.img.susercontent.com/file/tw-11134207-7rasc-m4vzrwzzf9al22"},
-  {name:"Smile Kids 兒童秋冬睡衣 台灣出貨 德絨 兒童睡衣 保暖內衣 兒童居家服 睡衣兒童 兒童家居服 小孩睡衣",price:298,orig:498,sold:566,rating:4.9,img:"https://down-tw.img.susercontent.com/file/tw-11134207-820lb-moryb4wtk17273"},
-  {name:"🔥特惠🔥視拍 23cm 進口義大利牛皮斜背包女400g 超輕多隔層 肩背包女 斜背包 出國側背包女 背包",price:1169,orig:1880,sold:408,rating:5.0,img:"https://down-tw.img.susercontent.com/file/tw-11134207-7rasa-m1p07o2r7pr1d7"},
-  {name:"🔥視拍 超軟牛角包 度假包包 肩背包女 包包大容量 出國側背包 iPad包 斜背包",price:1431,orig:2180,sold:368,rating:5.0,img:"https://down-tw.img.susercontent.com/file/tw-11134207-81ztd-mh90lu31pqmgcd"},
-  {name:"永恆蓮保濕指緣液指緣硬皮必備Trind 85折好吸收效果強者",price:663,orig:899,sold:319,rating:5.0,img:"https://down-tw.img.susercontent.com/file/184a1d91e12521c1005e1b95cf90b362"},
-  {name:"女童背心 發育內衣 兒童背心 吊帶背心 女童10-15歲內衣裹胸 兒童發育期小背心 莫代爾抹胸",price:244,orig:399,sold:293,rating:4.8,img:"https://down-tw.img.susercontent.com/file/4df569e2c8f09344b4eb858e68903fbb"},
-  {name:"全真皮簡約實用零錢包 薄款卡片包 超薄皮夾",price:299,orig:599,sold:1200,rating:4.9,badge:"shop",img:""},
-];
-
 const grid = document.getElementById('grid');
-products.forEach((p,i)=>{
-  const discount = Math.round((1-p.price/p.orig)*100);
-  const badge = p.badge === 'official' ? '<span class="official-badge">商城</span>' :
-                p.badge === 'shop' ? '<span class="shop-badge">優選</span>' : '';
+document.getElementById('count').textContent = '共 ' + PRODUCTS.length + ' 件商品';
+PRODUCTS.forEach((p,i)=>{
+  const discount = p.o > p.p ? Math.round((1-p.p/p.o)*100) : 0;
   const hue = (i*37)%360;
   const imgHtml = p.img
-    ? `<img src="${p.img}" loading="lazy" onerror="this.parentElement.innerHTML='<div style=\\'width:100%;height:100%;background:hsl(${hue},40%,85%);display:flex;align-items:center;justify-content:center;font-size:40px\\'>👜</div>'">`
-    : `<div style="width:100%;height:100%;background:hsl(${hue},40%,85%);display:flex;align-items:center;justify-content:center;font-size:40px">👜</div>`;
+    ? `<img src="${p.img}" loading="lazy" onerror="this.parentElement.innerHTML='<div style=\\'width:100%;height:100%;background:hsl(${hue},40%,85%);display:flex;align-items:center;justify-content:center;font-size:40px\\'>📦</div>'">`
+    : `<div style="width:100%;height:100%;background:hsl(${hue},40%,85%);display:flex;align-items:center;justify-content:center;font-size:40px">📦</div>`;
   grid.innerHTML += `
     <div class="card">
       <div class="card-img">
@@ -206,14 +181,14 @@ products.forEach((p,i)=>{
         ${discount>0?`<span class="card-discount">-${discount}%</span>`:''}
       </div>
       <div class="card-body">
-        <div class="card-name">${badge}${p.name}</div>
+        <div class="card-name">${p.n}</div>
         <div class="card-price">
-          <span class="card-price-now">NT$${p.price}</span>
-          <span class="card-price-orig">NT$${p.orig}</span>
+          <span class="card-price-now">NT$${p.p}</span>
+          ${p.o>p.p?`<span class="card-price-orig">NT$${p.o}</span>`:''}
         </div>
         <div class="card-meta">
-          <span class="card-rating">★ ${p.rating}</span>
-          <span>已賣 ${p.sold.toLocaleString()}</span>
+          <span class="card-rating">★ ${p.r}</span>
+          <span>已賣 ${p.s.toLocaleString()}</span>
         </div>
       </div>
     </div>`;
