@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v3.1.6（台灣/海外雙選品）
+// @name         蝦皮選品器 v3.1.7（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      3.1.6
+// @version      3.1.7
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -866,7 +866,7 @@
 
   // 仿人節奏：隨機延遲（基礎 ms 的 100%~160%）
   function humanSleep(base) {
-    return sleep(base + Math.floor(Math.random() * base * 0.6));
+    return sleep(base + Math.floor(Math.random() * base * 0.3));
   }
 
   // 等頁面真的出卡片（仿真人等加載），最多 timeoutMs
@@ -1516,13 +1516,13 @@
           sel.phase = "search"; sel.jumped = false; sel.refilteredCurrent = false;
           sel.filtersApplied = false; sel.restartCount = 0; sel.emptyStep = 0;
           saveSelectState(sel);
-          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, 15000);
+          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, 8000);
         },
         onerror: () => {
           sel.kwIndex = 0; sel.kw = kwList[0];
           sel.page = 1; sel.pagesUsed = 0; sel.storesDone = 0;
           sel.phase = "search"; saveSelectState(sel);
-          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, 15000);
+          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, 8000);
         }
       });
     }
@@ -1764,7 +1764,7 @@
     const kw = kwList[0];
     selLog(log, `📋 共 ${kwList.length} 個關鍵詞：${kwList.join("、")}`);
     const min = Math.max(0, Number(((document.querySelector(".sp-sel-min") || {}).value) || selGet("min", 200)));
-    const maxStores = Math.max(1, Math.min(50, Number(((document.querySelector(".sp-sel-stores") || {}).value) || selGet("stores", 10))));
+    const maxStores = Math.max(1, Math.min(50, Number(((document.querySelector(".sp-sel-stores") || {}).value) || selGet("stores", 20))));
     const minPage = Math.max(1, Math.min(200, Number(((document.querySelector(".sp-sel-minpage") || {}).value) || selGet("minPage", 5))));
     const maxPages = Math.max(1, Math.min(200, Number(((document.querySelector(".sp-sel-pages") || {}).value) || selGet("maxPages", 30))));
     const minSold = Math.max(0, Number(((document.querySelector(".sp-sel-sold") || {}).value) || selGet("minSold", 0)));
