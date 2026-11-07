@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v3.1.8（台灣/海外雙選品）
+// @name         蝦皮選品器 v3.1.9（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      3.1.8
+// @version      3.1.9
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -32,15 +32,18 @@
 
   // 看门狗：超过10分钟无活动就发邮件+自动刷新
   let lastActivity = Date.now();
+  let watchdogNotified = false;
   function touch() { lastActivity = Date.now(); }
   setInterval(() => {
+    // 只要选品标志在就监控，不依赖其他条件
     if (!localStorage.getItem(SELECT_FLAG)) return;
     const idle = (Date.now() - lastActivity) / 1000;
-    if (idle > 600) { // 10分钟
+    if (idle > 600 && !watchdogNotified) { // 10分钟
+      watchdogNotified = true;
       sendNotify("⚠️ 脚本卡住了", `已 ${Math.round(idle/60)} 分钟无活动，自动刷新页面恢复。\n时间: ` + new Date().toLocaleString());
-      setTimeout(() => location.reload(), 3000);
+      setTimeout(() => location.reload(), 5000);
     }
-  }, 60000);
+  }, 30000); // 每30秒检查一次
 
   function loadSettings() {
     try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch (_) { return {}; }
@@ -879,6 +882,7 @@
 
   // 仿人節奏：隨機延遲（基礎 ms 的 100%~160%）
   function humanSleep(base) {
+    touch();
     return sleep(base + Math.floor(Math.random() * base * 0.3));
   }
 
