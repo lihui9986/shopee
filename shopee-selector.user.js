@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器 v3.2.0（多標籤並行採集）
 // @namespace    shopee-crawler
-// @version      3.2.0
+// @version      3.2.1
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -48,7 +48,13 @@
   }, 30000); // 每30秒检查一次
 
   function loadSettings() {
-    try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch (_) { return {}; }
+    try {
+      const s = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+      // 预填默认服务器和令牌
+      if (!s.server) s.server = "http://192.168.142.111:4180";
+      if (!s.token) s.token = "xk_3f824111e24061a698569f26ac0f85c9";
+      return s;
+    } catch (_) { return { server: "http://192.168.142.111:4180", token: "xk_3f824111e24061a698569f26ac0f85c9" }; }
   }
   function saveSettings(patch) {
     const next = { ...loadSettings(), ...patch };
