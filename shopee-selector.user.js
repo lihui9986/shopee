@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v3.1.9（台灣/海外雙選品）
+// @name         蝦皮選品器 v3.2.0（多標籤並行採集）
 // @namespace    shopee-crawler
-// @version      3.1.9
+// @version      3.2.0
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -19,6 +19,8 @@
   window.__spCrawlerV15 = true;
 
   const SETTINGS_KEY = "sp_crawler_settings_v14";
+  // 每个标签页独立状态，支持多标签并行采集
+  const localStorage = sessionStorage;
   const QUEUE_KEY = "sp_crawler_queue_v14";
   const AUTO_KEY = "sp_crawler_auto_v14";
   const SELECT_STATE_KEY = "sp_select_state_v1";
@@ -36,7 +38,7 @@
   function touch() { lastActivity = Date.now(); }
   setInterval(() => {
     // 只要选品标志在就监控，不依赖其他条件
-    if (!localStorage.getItem(SELECT_FLAG)) return;
+    if (!tabStore.getItem(SELECT_FLAG)) return;
     const idle = (Date.now() - lastActivity) / 1000;
     if (idle > 600 && !watchdogNotified) { // 10分钟
       watchdogNotified = true;
@@ -53,7 +55,7 @@
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
     return next;
   }
-  function setStatus(msg) { localStorage.setItem(STATUS_KEY, msg); }
+  function setStatus(msg) { tabStore.setItem(STATUS_KEY, msg); }
 
   // 全局崩潰上報：未捕獲的異步異常打到面板狀態+調試通道，杜絕無聲卡死（頁面自身的 error 事件太吵，不掛）
   window.addEventListener("unhandledrejection", (event) => {
@@ -491,8 +493,8 @@
     const all = listResult.shops || [];
     if (!all.length) { log("⚠️ 工作台名單為空，請先在「竞店爬虫」欄目保存名單"); return; }
     const queue = all.map((shop) => ({ username: shop.username, filters: shop.filters }));
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
-    localStorage.setItem(AUTO_KEY, "1");
+    tabStore.setItem(QUEUE_KEY, JSON.stringify(queue));
+    tabStore.setItem(AUTO_KEY, "1");
     setStatus(`同步抓取：0/${queue.length}`);
     log(`🤖 開始抓取全部 ${queue.length} 家監控店鋪，正在跳轉到第一家…`);
     state.running = true;
@@ -511,8 +513,8 @@
     if (skipped) log(`⏭ ${skipped} 家店鋪未到抓取週期，已跳過`);
     if (!due.length) { log("✅ 所有店鋪都未到抓取週期，無需抓取"); return; }
     const queue = due.map((shop) => ({ username: shop.username, filters: shop.filters }));
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
-    localStorage.setItem(AUTO_KEY, "1");
+    tabStore.setItem(QUEUE_KEY, JSON.stringify(queue));
+    tabStore.setItem(AUTO_KEY, "1");
     setStatus(`補抓到期：0/${queue.length}`);
     log(`🤖 補抓 ${queue.length} 家到期店鋪，正在跳轉到第一家…`);
     state.running = true;
@@ -520,9 +522,9 @@
   }
 
   async function continueAutoMode(log) {
-    const queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+    const queue = JSON.parse(tabStore.getItem(QUEUE_KEY) || "[]");
     if (!queue.length) {
-      localStorage.removeItem(AUTO_KEY);
+      tabStore.removeItem(AUTO_KEY);
       setStatus("自動模式完成");
       log("✅ 全部完成！");
       sendNotify("✅ 自動抓取完成", "全部監控店鋪已抓取完畢。\n時間: " + new Date().toLocaleString());
@@ -534,15 +536,15 @@
     const entry = queue[0];
     const result = await captureCurrentShop(entry, log);
     const rest = queue.slice(1);
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(rest));
+    tabStore.setItem(QUEUE_KEY, JSON.stringify(rest));
     if (rest.length) {
       setStatus(`自動模式：已處理，剩餘 ${rest.length} 家`);
       log(`➡️ 3 秒後前往下一家：${rest[0].username}`);
       await sleep(3000);
       location.href = "https://shopee.tw/" + rest[0].username;
     } else {
-      localStorage.removeItem(AUTO_KEY);
-      localStorage.removeItem(QUEUE_KEY);
+      tabStore.removeItem(AUTO_KEY);
+      tabStore.removeItem(QUEUE_KEY);
       setStatus("自動模式完成");
       log("✅ 全部完成！");
       sendNotify("✅ 自動抓取完成", "全部監控店鋪已抓取完畢。\n時間: " + new Date().toLocaleString());
@@ -682,7 +684,7 @@
       logBox.appendChild(line);
       logBox.scrollTop = logBox.scrollHeight;
     };
-    const savedStatus = localStorage.getItem(STATUS_KEY);
+    const savedStatus = tabStore.getItem(STATUS_KEY);
     if (savedStatus) statusBox.textContent = savedStatus;
 
     const toggleRunning = () => {
@@ -694,19 +696,19 @@
     panel.querySelector(".sp-sync").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); startSyncAllMode(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); sendNotify("💥 抓取任務異常", m); }).finally(finishTask); } });
     panel.querySelector(".sp-due").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); startDueMode(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); }).finally(finishTask); } });
     panel.querySelector(".sp-here").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); captureHereWithFreshFilters(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); }).finally(finishTask); } });
-    panel.querySelector(".sp-stop").addEventListener("click", () => { state.running = false; localStorage.removeItem(AUTO_KEY); localStorage.removeItem(SELECT_FLAG); saveSelectState(null); log("⏹ 已停止"); });
+    panel.querySelector(".sp-stop").addEventListener("click", () => { state.running = false; tabStore.removeItem(AUTO_KEY); tabStore.removeItem(SELECT_FLAG); saveSelectState(null); log("⏹ 已停止"); });
     panel.querySelector(".sp-sel-start-tw").addEventListener("click", () => { if (!state.running) { state.running = true; toggleRunning(); startSelectMode(log, "tw").catch((e) => selLog(log, `💥 啟動異常: ${e && e.message ? e.message : e}`)).finally(finishTask); } });
     panel.querySelector(".sp-sel-start-os").addEventListener("click", () => { if (!state.running) { state.running = true; toggleRunning(); startSelectMode(log, "os").catch((e) => selLog(log, `💥 啟動異常: ${e && e.message ? e.message : e}`)).finally(finishTask); } });
     panel.querySelector(".sp-sel-stop").addEventListener("click", () => {
       state.running = false;
-      localStorage.removeItem(SELECT_FLAG);
+      tabStore.removeItem(SELECT_FLAG);
       saveSelectState(null);
       setStatus("選品模式：已停止");
       log("⏹ 選品已停止（進度清除）");
     });
     panel.querySelector(".sp-sel-pause").addEventListener("click", () => {
       const sel = loadSelectState();
-      if (!sel || !localStorage.getItem(SELECT_FLAG)) { log("沒有進行中的選品任務"); return; }
+      if (!sel || !tabStore.getItem(SELECT_FLAG)) { log("沒有進行中的選品任務"); return; }
       sel.paused = true;
       saveSelectState(sel);
       state.running = false;
@@ -735,20 +737,20 @@
 
     // 選品模式續跑：標誌存在時任何頁面載入都繼續流程
     if (!window.__spDbgLoop && loadSettings().token) { window.__spDbgLoop = true; dbgCommandLoop(); }
-    if (localStorage.getItem(SELECT_FLAG)) {
+    if (tabStore.getItem(SELECT_FLAG)) {
       log("🔁 選品模式繼續…");
       continueSelectMode(log).catch((e) => { const msg = `💥 續跑異常: ${e && e.message ? e.message : e}`; log(msg); setStatus(msg); dbgLog(msg); });
       return;
     }
     // 定時補抓：開關打開時，首頁載入後自動檢查到期店鋪並開始抓取
-    if (settings.autoCheck && !localStorage.getItem(AUTO_KEY) && (location.pathname === "/" || location.pathname === "")) {
+    if (settings.autoCheck && !tabStore.getItem(AUTO_KEY) && (location.pathname === "/" || location.pathname === "")) {
       log("🕐 自動補抓檢查中…");
       startDueMode(log);
       return;
     }
-    if (localStorage.getItem(AUTO_KEY) === "1") {
+    if (tabStore.getItem(AUTO_KEY) === "1") {
       if (location.pathname.includes("/verify/")) {
-        localStorage.removeItem(AUTO_KEY);
+        tabStore.removeItem(AUTO_KEY);
         setStatus("自動模式被風控中斷");
         log("❌ 蝦皮風控攔截了頁面。請稍等幾分鐘再試，或換一個節點後重新點「同步名單並抓取」。");
         sendNotify("⚠️ 被蝦皮風控攔截", "自動抓取被風控中斷，請檢查頁面。\n時間: " + new Date().toLocaleString());
@@ -837,11 +839,11 @@
   }
 
   function loadSelectState() {
-    try { return JSON.parse(localStorage.getItem(SELECT_STATE_KEY)) || null; } catch (_) { return null; }
+    try { return JSON.parse(tabStore.getItem(SELECT_STATE_KEY)) || null; } catch (_) { return null; }
   }
   function saveSelectState(st) {
-    if (st === null) localStorage.removeItem(SELECT_STATE_KEY);
-    else localStorage.setItem(SELECT_STATE_KEY, JSON.stringify(st));
+    if (st === null) tabStore.removeItem(SELECT_STATE_KEY);
+    else tabStore.setItem(SELECT_STATE_KEY, JSON.stringify(st));
   }
 
   function buildApiItemMap() {
@@ -1836,7 +1838,7 @@
     try {
       const state = { kw: kw, kwList: kwList, kwIndex: 0, min, maxPrice, minSold, maxSold, maxStores, minPage, maxPages, loc, mode, page: 1, pagesUsed: 0, pendingCards: [], visitedShops: [], visitedShopIds: [], storesDone: 0, phase: "search", refilteredCurrent: false };
       saveSelectState(state);
-      localStorage.setItem(SELECT_FLAG, "1");
+      tabStore.setItem(SELECT_FLAG, "1");
       state.running = true;
       setStatus("選品模式：啟動");
       selLog(log, `🚀 ${loc === "overseas" ? "海外" : "台灣"}選品啟動：「${kw.trim()}」價格 ${min}${maxPrice ? "~" + maxPrice : "~∞"}｜月銷 ${minSold || 0}${maxSold ? "~" + maxSold : "~∞"}｜店鋪≤${maxStores}${loc === "tw" ? "｜篩到第 " + minPage + " 頁" : "｜從第 1 頁向後採 " + maxPages + " 頁"}`);
@@ -1851,7 +1853,7 @@
       const sel = loadSelectState();
       if (!sel || !sel.phase || !sel.kw || sel.min === undefined || sel.maxPrice === undefined || sel.minSold === undefined || sel.maxSold === undefined || sel.maxStores === undefined || sel.minPage === undefined || sel.maxPages === undefined) {
         // 舊版/殘缺狀態（篩選參數不全）：清掉讓用戶重新啟動，避免用錯誤參數採集
-        localStorage.removeItem(SELECT_FLAG);
+        tabStore.removeItem(SELECT_FLAG);
         saveSelectState(null);
         setStatus("選品狀態無效，請重新點開始選品");
         selLog(log, "❌ 選品狀態無效或參數不全，已清除——請確認面板參數後重新點「開始選品」啟動");
@@ -1878,7 +1880,7 @@
         // 輪詢等待人工過驗證
         state.running = false;
         const waitForVerify = setInterval(() => {
-          if (!localStorage.getItem(SELECT_FLAG)) { clearInterval(waitForVerify); return; }
+          if (!tabStore.getItem(SELECT_FLAG)) { clearInterval(waitForVerify); return; }
           if (!location.pathname.includes("/verify/")) {
             clearInterval(waitForVerify);
             selLog(log, "✅ 驗證已通過，自動繼續選品…");
