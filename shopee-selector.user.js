@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器 v3.2.0（多標籤並行採集）
 // @namespace    shopee-crawler
-// @version      3.2.1
+// @version      3.3.0
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
