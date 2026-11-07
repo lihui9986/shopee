@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v3.5.0（台灣/海外雙選品）
+// @name         蝦皮選品器 v3.5.1（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      3.5.0
+// @version      3.5.1
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -560,7 +560,7 @@
     panel.style.cssText = "position:fixed;top:80px;right:16px;z-index:999999;width:320px;background:#fff;border:2px solid #ee4d2d;border-radius:8px;padding:10px;font:12px/1.5 sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.2)";
     const settings = loadSettings();
     panel.innerHTML =
-      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v3.5.0 · 台灣/海外雙選品</div>' +
+      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v3.5.1 · 台灣/海外雙選品</div>' +
       '<input class="sp-server" autocomplete="off" placeholder="工作台地址，其他電腦填 http://伺服器IP:4180" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<input class="sp-token" autocomplete="off" placeholder="連接令牌（工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-auto-check"> 打開蝦皮時自動補抓到期店鋪</label>' +
@@ -616,7 +616,7 @@
     tokenInput.value = settings.token || "";
     // 選品參數記憶：自動回填上一次使用的值
     const selGet = (key, fallback) => {
-      const v = localStorage.getItem("sp_sel_" + key);
+      const v = tabStore.getItem("sp_sel_" + key);
       return v === null || v === "" ? fallback : v;
     };
     const prefill = (cls, key, fallback, numeric) => {
@@ -624,7 +624,7 @@
       if (!el) return;
       let v = selGet(key, fallback);
       if (numeric) { const n = Number(v); v = Number.isFinite(n) && n >= 0 ? String(n) : String(fallback); }
-      if (key === "kw" && /^https?:\/\//.test(v)) { localStorage.removeItem("sp_sel_kw"); v = ""; }
+      if (key === "kw" && /^https?:\/\//.test(v)) { tabStore.removeItem("sp_sel_kw"); v = ""; }
       el.value = v;
     };
     prefill(".sp-sel-kw", "kw", "");
@@ -735,7 +735,7 @@
       if (el) el.addEventListener("input", () => {
         let v = el.value.trim();
         if (numeric) { const n = Number(v); v = Number.isFinite(n) && n >= 0 ? String(n) : ""; }
-        localStorage.setItem("sp_sel_" + key, v);
+        tabStore.setItem("sp_sel_" + key, v);
       });
     }
     panel.querySelector(".sp-bye").addEventListener("click", () => panel.remove());
@@ -1784,7 +1784,7 @@
   async function startSelectMode(log, mode) {
     if (!window.__spDbgLoop) { window.__spDbgLoop = true; dbgCommandLoop(); }
     const selGet = (key, fallback) => {
-      const v = localStorage.getItem("sp_sel_" + key);
+      const v = tabStore.getItem("sp_sel_" + key);
       return v === null || v === "" ? fallback : v;
     };
     let kwRaw = ((document.querySelector(".sp-sel-kw") || {}).value || selGet("kw", ""));
@@ -1803,15 +1803,15 @@
     const maxSold = Math.max(0, Number(((document.querySelector(".sp-sel-maxsold") || {}).value) || selGet("maxSold", 0)));
     const loc = mode === "os" ? "overseas" : "tw";
     if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
-    localStorage.setItem("sp_sel_kw", kw.trim());
-    localStorage.setItem("sp_sel_min", String(min));
-    localStorage.setItem("sp_sel_maxPrice", String(maxPrice));
-    localStorage.setItem("sp_sel_minSold", String(minSold));
-    localStorage.setItem("sp_sel_maxSold", String(maxSold));
-    localStorage.setItem("sp_sel_stores", String(maxStores));
-    localStorage.setItem("sp_sel_minPage", String(minPage));
-    localStorage.setItem("sp_sel_maxPages", String(maxPages));
-    localStorage.setItem("sp_sel_loc", loc);
+    tabStore.setItem("sp_sel_kw", kw.trim());
+    tabStore.setItem("sp_sel_min", String(min));
+    tabStore.setItem("sp_sel_maxPrice", String(maxPrice));
+    tabStore.setItem("sp_sel_minSold", String(minSold));
+    tabStore.setItem("sp_sel_maxSold", String(maxSold));
+    tabStore.setItem("sp_sel_stores", String(maxStores));
+    tabStore.setItem("sp_sel_minPage", String(minPage));
+    tabStore.setItem("sp_sel_maxPages", String(maxPages));
+    tabStore.setItem("sp_sel_loc", loc);
     // 從工作台拉取近 30 天採集過的店鋪（記憶以工作台數據為準，跨設備有效）
     const settings0 = loadSettings();
     const server0 = (settings0.server || "").replace(/\/+$/, "");
@@ -1951,6 +1951,8 @@
   if (document.body) buildPanel();
   else window.addEventListener("DOMContentLoaded", buildPanel);
 })();
+
+
 
 
 
