@@ -883,7 +883,8 @@
   // 仿人節奏：隨機延遲（基礎 ms 的 100%~160%）
   function humanSleep(base) {
     touch();
-    return sleep(base + Math.floor(Math.random() * base * 0.3));
+    const SLOW = 1.6; // 风控期减速系数：1=正常，>1=更慢更安全
+    return sleep(base * SLOW + Math.floor(Math.random() * base * SLOW * 0.5));
   }
 
   // 等頁面真的出卡片（仿真人等加載），最多 timeoutMs
