@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v3.1.5（台灣/海外雙選品）
+// @name         蝦皮選品器 v3.1.6（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      3.1.5
+// @version      3.1.6
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -1483,26 +1483,48 @@
       setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(nextKw)}`; }, 3000);
       return;
     }
-    // 所有關鍵詞都跑完了 → 循環重來（持續採集模式）
-    selLog(log, `🔄 所有 ${kwList.length} 個關鍵詞全部跑完，30 秒後從頭開始循環…`);
-    sendNotify("🔄 全部關鍵詞完成，自動循環", `已完成 ${kwList.length} 個關鍵詞，即將循環重新開始。\n時間: ` + new Date().toLocaleString());
+    // 所有關鍵詞都跑完了 → 從服務器拉最新Top20爆款，重新開始輪詢
+    selLog(log, `🔄 全部跑完，正在從服務器拉最新Top20爆款…`);
+    sendNotify("🔄 本輪完成，拉取最新爆款", `即將自動開始新一輪爆款採集。\n時間: ` + new Date().toLocaleString());
     if (sel) {
-      sel.kwIndex = 0;
-      sel.kw = kwList[0];
-      sel.page = 1;
-      sel.pagesUsed = 0;
-      sel.storesDone = 0;
-      sel.pendingCards = [];
-      sel.visitedShops = [];
-      sel.visitedShopIds = [];
-      sel.phase = "search";
-      sel.jumped = false;
-      sel.refilteredCurrent = false;
-      sel.filtersApplied = false;
-      sel.restartCount = 0;
-      sel.emptyStep = 0;
-      saveSelectState(sel);
-      setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(kwList[0])}`; }, 30000);
+      const settings0 = loadSettings();
+      const server0 = (settings0.server || "").replace(/\/+$/, "");
+      GM_xmlhttpRequest({
+        method: "GET", url: server0 + "/api/hot-products",
+        headers: { "X-Crawler-Token": settings0.token || "" }, timeout: 10000,
+        onload: (r) => {
+          try {
+            const resp = JSON.parse(r.responseText);
+            if (resp.ok && resp.products && resp.products.length) {
+              const newKw = resp.products.slice(0, 20);
+              selLog(log, `🔥 拉到 ${newKw.length} 個最新爆款：${newKw.slice(0,3).join("、")}...`);
+              sel.kwList = newKw;
+              sel.kwIndex = 0;
+              sel.kw = newKw[0];
+            } else {
+              selLog(log, "⚠️ 拉取爆款失敗，用原列表循環");
+              sel.kwIndex = 0;
+              sel.kw = kwList[0];
+            }
+          } catch(e) {
+            selLog(log, "⚠️ 拉取出錯，用原列表循環");
+            sel.kwIndex = 0;
+            sel.kw = kwList[0];
+          }
+          sel.page = 1; sel.pagesUsed = 0; sel.storesDone = 0;
+          sel.pendingCards = []; sel.visitedShops = []; sel.visitedShopIds = [];
+          sel.phase = "search"; sel.jumped = false; sel.refilteredCurrent = false;
+          sel.filtersApplied = false; sel.restartCount = 0; sel.emptyStep = 0;
+          saveSelectState(sel);
+          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, 15000);
+        },
+        onerror: () => {
+          sel.kwIndex = 0; sel.kw = kwList[0];
+          sel.page = 1; sel.pagesUsed = 0; sel.storesDone = 0;
+          sel.phase = "search"; saveSelectState(sel);
+          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, 15000);
+        }
+      });
     }
   }
 
@@ -1746,7 +1768,7 @@
     const minPage = Math.max(1, Math.min(200, Number(((document.querySelector(".sp-sel-minpage") || {}).value) || selGet("minPage", 5))));
     const maxPages = Math.max(1, Math.min(200, Number(((document.querySelector(".sp-sel-pages") || {}).value) || selGet("maxPages", 30))));
     const minSold = Math.max(0, Number(((document.querySelector(".sp-sel-sold") || {}).value) || selGet("minSold", 0)));
-    const maxPrice = Math.max(0, Number(((document.querySelector(".sp-sel-maxp") || {}).value) || selGet("maxPrice", 0)));
+    const maxPrice = Math.max(0, Number(((document.querySelector(".sp-sel-maxp") || {}).value) || selGet("maxPrice", 500)));
     const maxSold = Math.max(0, Number(((document.querySelector(".sp-sel-maxsold") || {}).value) || selGet("maxSold", 0)));
     const loc = mode === "os" ? "overseas" : "tw";
     if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
