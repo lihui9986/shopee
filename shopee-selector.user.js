@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v3.1.7（台灣/海外雙選品）
+// @name         蝦皮選品器 v3.1.8（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      3.1.7
+// @version      3.1.8
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -29,6 +29,18 @@
   const HDRS = { "x-api-source": "pc", "X-Requested-With": "XMLHttpRequest" };
   const state = { running: false };
   const captured = { shopBases: [], items: [], itemDetails: new Map() };
+
+  // 看门狗：超过10分钟无活动就发邮件+自动刷新
+  let lastActivity = Date.now();
+  function touch() { lastActivity = Date.now(); }
+  setInterval(() => {
+    if (!localStorage.getItem(SELECT_FLAG)) return;
+    const idle = (Date.now() - lastActivity) / 1000;
+    if (idle > 600) { // 10分钟
+      sendNotify("⚠️ 脚本卡住了", `已 ${Math.round(idle/60)} 分钟无活动，自动刷新页面恢复。\n时间: ` + new Date().toLocaleString());
+      setTimeout(() => location.reload(), 3000);
+    }
+  }, 60000);
 
   function loadSettings() {
     try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch (_) { return {}; }
@@ -332,6 +344,7 @@
       });
       log(`✅ 已入庫：批次 #${result.runId}，${result.shops} 店鋪 / ${result.products} 商品`);
       if (result.duplicates) log(`⚠️ 提醒：其中 ${result.duplicates} 個商品之前已採集過，本次記錄為最新批次`);
+      touch();
       return true;
     } catch (error) {
       log("❌ 入庫失敗：" + error.message);
@@ -874,7 +887,7 @@
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
       if (state.running === false) return false;
-      if (document.querySelectorAll('a[href*="-i."]').length >= minCount) return true;
+      if (document.querySelectorAll('a[href*="-i."]').length >= minCount) { touch(); return true; }
       await sleep(700 + Math.floor(Math.random() * 700));
     }
     return document.querySelectorAll('a[href*="-i."]').length > 0;
