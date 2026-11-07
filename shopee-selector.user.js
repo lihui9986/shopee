@@ -1925,10 +1925,11 @@
     } catch (error) {
       dbgLog("💥 選品崩潰：" + (error && error.message) + " @ " + location.pathname);
       dbgFlush();
-      setStatus("選品出錯已停止，詳見調試通道");
-      localStorage.removeItem(SELECT_FLAG);
-      saveSelectState(null);
+      setStatus("選品出錯，即將自動刷新恢復…");
+      // 不清SELECT_FLAG，讓看門狗自動刷新恢復
       sendNotify("💥 選品腳本崩潰", "錯誤: " + (error && error.message ? error.message : error) + "\n頁面: " + location.pathname + "\n時間: " + new Date().toLocaleString());
+      // 30秒後自動刷新
+      setTimeout(() => location.reload(), 30000);
     }
   }
 
