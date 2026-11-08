@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.5（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.6（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.5
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）
+// @version      4.2.6
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -1995,7 +1995,7 @@
   "use strict";
   var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
   var BEAT_MS = 10000;
-  var VERSION = "sel-4.2.4";
+  var VERSION = "sel-4.2.6";
   var SRC = {
     status: "sp_crawler_status_v14",
     selectState: "sp_select_state_v1",
@@ -2044,6 +2044,7 @@
   write(OWN.builtin, "1");
 
   var lastError = "", lastErrorAt = 0;
+  var pageStart = Date.now(); // 本頁載入時間：idle 以頁面壽命為上限，防止跨頁誤報
   window.addEventListener("unhandledrejection", function (ev) {
     try {
       var r = ev.reason;
@@ -2086,6 +2087,10 @@
     }
     var changed = Number(read(OWN.lastChange) || now);
     var idleSec = Math.max(0, Math.round((now - changed) / 1000));
+    // lastChange 存在 sessionStorage、跨頁刷新存活：頁面剛載入可能繼承上個頁面的舊時間戳，
+    // 導致 idle 虛高、後台誤判「卡住」。頁面載入本身就是活動 → idle 不得超過本頁壽命。
+    var pageAgeSec = Math.max(0, Math.round((now - pageStart) / 1000));
+    if (idleSec > pageAgeSec) idleSec = pageAgeSec;
 
     var payload = {
       tab_id: tabId,
