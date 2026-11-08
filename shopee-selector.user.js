@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.4（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.5（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.4
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）
+// @version      4.2.5
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -102,6 +102,12 @@
     return result;
   }
 
+  // 內存保護：捕獲包只保留最近 cap 個（正常流程遠低於上限，僅防長時間不刷新頁面的失控堆積）
+  function pushCapped(arr, value, cap) {
+    arr.push(value);
+    if (arr.length > cap) arr.splice(0, arr.length - cap);
+  }
+
   function installHooks() {
     if (window.__spHooksInstalled) return;
     window.__spHooksInstalled = true;
@@ -113,8 +119,8 @@
         const response = await Reflect.apply(origFetch, pageWindow, args);
         try {
           const url = String((args[0] && args[0].url) || args[0] || "");
-          if (url.includes("/api/v4/shop/get_shop_base")) captured.shopBases.push(await response.clone().json());
-          else if (url.includes("/api/v4/shop/search_items")) captured.items.push(await response.clone().json());
+          if (url.includes("/api/v4/shop/get_shop_base")) pushCapped(captured.shopBases, await response.clone().json(), 20);
+          else if (url.includes("/api/v4/shop/search_items")) pushCapped(captured.items, await response.clone().json(), 160);
           else if (url.includes("/api/v4/pdp/get_pc") || url.includes("/api/v4/item/get")) captureItemDetail(await response.clone().json());
         } catch (_) { /* 忽略 */ }
         return response;
@@ -130,8 +136,8 @@
       this.addEventListener("load", () => {
         try {
           if (!this.__spUrl) return;
-          if (this.__spUrl.includes("/api/v4/shop/get_shop_base")) captured.shopBases.push(JSON.parse(this.responseText));
-          else if (this.__spUrl.includes("/api/v4/shop/search_items")) captured.items.push(JSON.parse(this.responseText));
+          if (this.__spUrl.includes("/api/v4/shop/get_shop_base")) pushCapped(captured.shopBases, JSON.parse(this.responseText), 20);
+          else if (this.__spUrl.includes("/api/v4/shop/search_items")) pushCapped(captured.items, JSON.parse(this.responseText), 160);
           else if (this.__spUrl.includes("/api/v4/pdp/get_pc") || this.__spUrl.includes("/api/v4/item/get")) captureItemDetail(JSON.parse(this.responseText));
         } catch (_) { /* 忽略 */ }
       });
@@ -242,8 +248,14 @@
     }
   }
 
+  // 增量合併：每個 seen 只處理自己沒合併過的捕獲包，避免每輪滾動都全量重掃歷史包。
+  // 遊標用 WeakMap 綁定 seen（而非全局變量）：新建 seen 會從 0 全量合併，不漏數據；
+  // 傳入臨時 Map（如預熱調用）也不會消耗其他 seen 的合併進度。
+  const mergeCursors = new WeakMap();
   function mergeApiItems(seen) {
-    for (const body of captured.items) {
+    const from = mergeCursors.get(seen) || 0;
+    for (let i = from; i < captured.items.length; i += 1) {
+      const body = captured.items[i];
       for (const entry of body.items || []) {
         const item = entry.item_basic || {};
         if (item.image === undefined && entry.image) item.image = entry.image;
@@ -254,6 +266,7 @@
         else seen.set(item.itemid, item);
       }
     }
+    mergeCursors.set(seen, captured.items.length);
   }
 
   function scrapeDomInto(seen) {
@@ -359,6 +372,10 @@
       });
       log(`✅ 已入庫：批次 #${result.runId}，${result.shops} 店鋪 / ${result.products} 商品`);
       if (result.duplicates) log(`⚠️ 提醒：其中 ${result.duplicates} 個商品之前已採集過，本次記錄為最新批次`);
+      // 數據已交給工作台，釋放捕獲包，避免同一頁面連續任務時內存持續堆積
+      //（已合併進 seen 的輕量商品對象由 seen 持有，不受清空影響；後續流程都用跳頁，會重新捕獲）
+      captured.items.length = 0;
+      if (captured.shopBases.length > 5) captured.shopBases.splice(0, captured.shopBases.length - 5);
       touch();
       return true;
     } catch (error) {
@@ -696,6 +713,8 @@
       const line = document.createElement("div");
       line.textContent = msg;
       logBox.appendChild(line);
+      // 日誌上限 200 條：超出移除最早的，防止長時間任務把面板 DOM 撐大拖慢頁面
+      while (logBox.childElementCount > 200) logBox.removeChild(logBox.firstChild);
       logBox.scrollTop = logBox.scrollHeight;
     };
     const savedStatus = tabStore.getItem(STATUS_KEY);
@@ -1791,6 +1810,9 @@
 
   async function startSelectMode(log, mode) {
     if (!window.__spDbgLoop) { window.__spDbgLoop = true; dbgCommandLoop(); }
+    // 新選品任務隨後會跳轉搜索頁重新捕獲，先釋放舊任務殘留的捕獲包
+    captured.items.length = 0;
+    captured.shopBases.length = 0;
     const selGet = (key, fallback) => {
       const v = tabStore.getItem("sp_sel_" + key);
       return v === null || v === "" ? fallback : v;
