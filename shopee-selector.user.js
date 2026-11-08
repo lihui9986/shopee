@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.6（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.7（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.6
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）
+// @version      4.2.7
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）；看門狗進化（日誌/狀態變化算進展、7 分鐘無進展自動刷新恢復、30 分鐘內反覆凍結 3 次停止恢復並告警）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -32,19 +32,31 @@
   const state = { running: false };
   const captured = { shopBases: [], items: [], itemDetails: new Map() };
 
-  // 看门狗：超过10分钟无活动就发邮件+自动刷新
+  // 看门狗：7分钟无任何进展（无日志/无出卡/无入库/无状态变化）就发邮件+自动刷新。
+  // 進展判定：touch()（出卡片/入库成功/setStatus）+ 每條面板日誌。掛死的 await 既無日志也無狀態變化 → 準時開火。
+  // 30 分鐘內反覆凍結 3 次則停止自動恢復並告警（防毒頁面無限刷新循環）。
   let lastActivity = Date.now();
   let watchdogNotified = false;
   function touch() { lastActivity = Date.now(); }
+  const WD_FIRES_KEY = "sp_watchdog_fires_v1";
   setInterval(() => {
-    // 只要选品标志在就监控，不依赖其他条件
-    if (!tabStore.getItem(SELECT_FLAG)) return;
+    // 选品/自动补抓/同步任一進行中都武装（state.running 覆蓋所有模式，含掛在 await 上的流程）
+    if (!tabStore.getItem(SELECT_FLAG) && !tabStore.getItem(AUTO_KEY) && !state.running) return;
     const idle = (Date.now() - lastActivity) / 1000;
-    if (idle > 600 && !watchdogNotified) { // 10分钟
-      watchdogNotified = true;
-      sendNotify("⚠️ 脚本卡住了", `已 ${Math.round(idle/60)} 分钟无活动，自动刷新页面恢复。\n时间: ` + new Date().toLocaleString());
-      setTimeout(() => location.reload(), 5000);
+    if (idle <= 420 || watchdogNotified) return; // 7分钟
+    watchdogNotified = true;
+    let fires = { n: 0, t: 0 };
+    try { fires = JSON.parse(tabStore.getItem(WD_FIRES_KEY) || '{"n":0,"t":0}') || fires; } catch (_) {}
+    if (Date.now() - (fires.t || 0) > 30 * 60 * 1000) fires = { n: 0, t: 0 };
+    fires.n += 1;
+    fires.t = Date.now();
+    try { tabStore.setItem(WD_FIRES_KEY, JSON.stringify(fires)); } catch (_) {}
+    if (fires.n > 3) {
+      sendNotify("🛑 腳本反覆凍結", `看門狗 30 分鐘內已自動恢復 ${fires.n - 1} 次仍再次凍結，已停止自動刷新，請人工檢查該標籤。\n頁面: ${location.href.slice(0, 120)}\n時間: ` + new Date().toLocaleString());
+      return;
     }
+    sendNotify("⚠️ 脚本卡住了", `已 ${Math.round(idle/60)} 分钟无任何进展，自动刷新页面恢复（30分钟内第 ${fires.n} 次）。\n页面: ${location.href.slice(0, 120)}\n时间: ` + new Date().toLocaleString());
+    setTimeout(() => location.reload(), 5000);
   }, 30000); // 每30秒检查一次
 
   function loadSettings() {
@@ -59,7 +71,7 @@
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
     return next;
   }
-  function setStatus(msg) { tabStore.setItem(STATUS_KEY, msg); }
+  function setStatus(msg) { touch(); tabStore.setItem(STATUS_KEY, msg); }
 
   // 全局崩潰上報：未捕獲的異步異常打到面板狀態+調試通道，杜絕無聲卡死（頁面自身的 error 事件太吵，不掛）
   window.addEventListener("unhandledrejection", (event) => {
@@ -710,6 +722,7 @@
     const logBox = panel.querySelector(".sp-log");
     const statusBox = panel.querySelector(".sp-status");
     const log = (msg) => {
+      touch(); // 每條日誌＝有進展：掛死的 await 不會產生日誌，看門狗才能區分「在幹活」和「凍結」
       const line = document.createElement("div");
       line.textContent = msg;
       logBox.appendChild(line);
@@ -1995,7 +2008,7 @@
   "use strict";
   var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
   var BEAT_MS = 10000;
-  var VERSION = "sel-4.2.6";
+  var VERSION = "sel-4.2.7";
   var SRC = {
     status: "sp_crawler_status_v14",
     selectState: "sp_select_state_v1",
