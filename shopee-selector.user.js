@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v3.5.3（台灣/海外雙選品）
+// @name         蝦皮選品器 v3.5.4（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      3.5.3
+// @version      3.5.4
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -324,9 +324,10 @@
 
   function applySourceFilter(items, filters, log) {
     const f = filters || {};
-    // 默认价格过滤200-500，服务器没配也强制生效
+    // 默认价格过滤200-500，最低销量>0，服务器没配也强制生效
     if (f.priceMin === null || f.priceMin === undefined) f.priceMin = 200;
     if (f.priceMax === null || f.priceMax === undefined) f.priceMax = 500;
+    if (f.histMin === null || f.histMin === undefined) f.histMin = 1;
     const hasFilter = ["soldMin", "soldMax", "histMin", "histMax", "priceMin", "priceMax"].some((k) => f[k] !== null && f[k] !== undefined);
     if (!hasFilter) return items;
     const kept = items.filter((item) => {
@@ -563,7 +564,7 @@
     panel.style.cssText = "position:fixed;top:80px;right:16px;z-index:999999;width:320px;background:#fff;border:2px solid #ee4d2d;border-radius:8px;padding:10px;font:12px/1.5 sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.2)";
     const settings = loadSettings();
     panel.innerHTML =
-      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v3.5.3 · 台灣/海外雙選品</div>' +
+      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v3.5.4 · 台灣/海外雙選品</div>' +
       '<input class="sp-server" autocomplete="off" placeholder="工作台地址，其他電腦填 http://伺服器IP:4180" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<input class="sp-token" autocomplete="off" placeholder="連接令牌（工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-auto-check"> 打開蝦皮時自動補抓到期店鋪</label>' +
@@ -1954,6 +1955,7 @@
   if (document.body) buildPanel();
   else window.addEventListener("DOMContentLoaded", buildPanel);
 })();
+
 
 
 
