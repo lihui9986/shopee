@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.3（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.4（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.3
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）
+// @version      4.2.4
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -1960,21 +1960,160 @@
   else window.addEventListener("DOMContentLoaded", buildPanel);
 })();
 
+/* =========================================================================
+ * 內建採集監控心跳 v1.0（4181 工作台）  —  追加式，不修改上方任何採集邏輯
+ * -------------------------------------------------------------------------
+ * · 由選品腳本本體直接上報，不需要另外安裝「選品採集監控探針」。
+ * · 每個 shopee 標籤的 sessionStorage 各自獨立 → 後台自動分成三張狀態卡。
+ * · 只讀狀態鍵 + POST 到獨立 monitor.db；不寫真庫、不改 4180、不干擾採集。
+ * · 回報地址可用 sessionStorage 的 sp_monitor_endpoint 覆蓋；
+ *   工作台若設了 ACCESS_KEY / MONITOR_KEY，用 sp_monitor_key 填同一個值。
+ * ========================================================================= */
+(function () {
+  "use strict";
+  var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
+  var BEAT_MS = 10000;
+  var VERSION = "sel-4.2.4";
+  var SRC = {
+    status: "sp_crawler_status_v14",
+    selectState: "sp_select_state_v1",
+    selectFlag: "sp_crawler_select_v1",
+    queue: "sp_crawler_queue_v14",
+    auto: "sp_crawler_auto_v14"
+  };
+  var OWN = {
+    endpoint: "sp_monitor_endpoint",
+    key: "sp_monitor_key",
+    tabId: "sp_monitor_tab_id",
+    label: "sp_monitor_tab_label",
+    lastChange: "sp_monitor_last_change",
+    lastStatus: "sp_monitor_last_status",
+    builtin: "sp_selector_heartbeat_on"
+  };
 
+  function store() { try { return window.sessionStorage; } catch (e) { return null; } }
+  function read(key) {
+    var s = store(), v = "";
+    if (s) { try { v = s.getItem(key) || ""; } catch (e) {} }
+    // 相容舊版若狀態寫在 localStorage：仍以 sessionStorage 優先（標籤隔離）
+    if (!v) { try { v = window.localStorage.getItem(key) || ""; } catch (e) {} }
+    return v;
+  }
+  function write(key, value) {
+    var s = store();
+    if (!s) return;
+    try { s.setItem(key, value); } catch (e) {}
+  }
+  function readJSON(key) {
+    try { return JSON.parse(read(key) || "null"); } catch (e) { return null; }
+  }
+  function endpoint() { return (read(OWN.endpoint) || DEFAULT_ENDPOINT).replace(/\/+$/, ""); }
 
+  // 與獨立監控探針共用同一組 tab_id / 標籤名，避免後台出現重複卡片
+  var tabId = read(OWN.tabId);
+  if (!tabId) {
+    tabId = "T" + Date.now().toString(36).toUpperCase() +
+            Math.random().toString(36).slice(2, 6).toUpperCase();
+    write(OWN.tabId, tabId);
+  }
+  var label = read(OWN.label) || ("標籤 " + tabId.slice(-4));
+  write(OWN.label, label);
+  // 若使用者也裝了獨立探針，探針會讓位，避免同一標籤雙重上報
+  write(OWN.builtin, "1");
 
+  var lastError = "", lastErrorAt = 0;
+  window.addEventListener("unhandledrejection", function (ev) {
+    try {
+      var r = ev.reason;
+      lastError = "💥 未處理異常: " + String((r && (r.stack || r.message)) || r).slice(0, 300);
+      lastErrorAt = Date.now();
+    } catch (e) {}
+  });
+  window.addEventListener("error", function (ev) {
+    try {
+      lastError = "💥 頁面錯誤: " + String(ev.message || "").slice(0, 300);
+      lastErrorAt = Date.now();
+    } catch (e) {}
+  });
 
+  // —— 只讀取選品腳本自己寫的狀態（與監控探針同一口徑）——
+  function collect() {
+    var statusText = read(SRC.status);
+    if (!statusText) {
+      var box = document.querySelector(".sp-status");
+      if (box && box.textContent) statusText = box.textContent.trim().slice(0, 300);
+    }
+    var sel = readJSON(SRC.selectState), phase = "", progress = "";
+    if (sel && typeof sel === "object") {
+      phase = String(sel.phase || "").slice(0, 40);
+      if (sel.storesDone !== undefined && sel.maxStores !== undefined) {
+        progress = sel.storesDone + "/" + sel.maxStores;
+      } else if (sel.page !== undefined && sel.pagesUsed !== undefined) {
+        progress = sel.pagesUsed + "/" + sel.maxPages;
+      }
+    }
+    var queue = readJSON(SRC.queue);
+    var queueLeft = Array.isArray(queue) ? queue.length : 0;
+    var running = !!read(SRC.selectFlag) || !!read(SRC.auto) || queueLeft > 0;
 
+    // 狀態文字多久沒變 → 前端無活動秒數（與選品腳本看門狗同一口徑）
+    var now = Date.now();
+    if (read(OWN.lastStatus) !== statusText) {
+      write(OWN.lastStatus, statusText);
+      write(OWN.lastChange, String(now));
+    }
+    var changed = Number(read(OWN.lastChange) || now);
+    var idleSec = Math.max(0, Math.round((now - changed) / 1000));
 
+    var payload = {
+      tab_id: tabId,
+      label: label,
+      kind: "heartbeat",
+      status_text: statusText.slice(0, 300),
+      phase: phase,
+      progress: progress,
+      running: running,
+      idle_sec: idleSec,
+      queue_left: queueLeft,
+      page: location.href.slice(0, 500),
+      probe_version: VERSION
+    };
+    if (lastError && Date.now() - lastErrorAt < 120000) payload.error = lastError;
+    return payload;
+  }
 
+  // —— 上報（GM 特權請求，不受混合內容限制）——
+  function post(payload) {
+    var key = read(OWN.key);
+    var headers = { "Content-Type": "application/json" };
+    if (key) { headers["X-Monitor-Key"] = key; headers["X-Access-Key"] = key; }
+    try {
+      GM_xmlhttpRequest({
+        method: "POST",
+        url: endpoint() + "/api/monitor/heartbeat",
+        headers: headers,
+        data: JSON.stringify(payload),
+        timeout: 10000,
+        onload: function (res) {
+          if (payload.error && res.status >= 200 && res.status < 300) lastError = "";
+        },
+        onerror: function () {},
+        ontimeout: function () {}
+      });
+    } catch (e) {}
+  }
 
+  function beat() { post(collect()); }
 
-
-
-
-
-
-
-
-
-
+  beat();
+  setInterval(beat, BEAT_MS);
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) beat();
+  });
+  window.addEventListener("pagehide", function () {
+    var p = collect(); p.kind = "offline"; post(p);
+  });
+  try {
+    console.log("[選品監控] 內建心跳已啟動 → " + endpoint() + " · " + tabId + " · " + VERSION);
+  } catch (e) {}
+})();
