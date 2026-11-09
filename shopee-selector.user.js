@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.12（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.13（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.12
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）；看門狗進化（日誌/狀態變化算進展、7 分鐘無進展自動刷新恢復、30 分鐘內反覆凍結 3 次停止恢復並告警）；選品價格過濾 fail-closed（設了價格帶卻無價格的商品直接拒，防發票專拍等無價商品入庫）；打轉死循環修復（失敗賣場記憶跳過＋連敗 10 店熔斷跳頁＋看門狗 30 分鐘零店數保險絲自動回搜索頁）；心跳上報標籤可見狀態（後台休眠不誤報卡住）；前台白屏 60 秒自動刷新（替代 7 分鐘看門狗）；fetch 鉤子容錯（網絡中止不誤報崩潰）
+// @version      4.2.13
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -310,7 +310,13 @@
         continue;
       }
       if (target[key] === null || target[key] === undefined || target[key] === "") target[key] = value;
-      else if (key === "name" && String(value).length > String(target[key]).length) target[key] = value;
+      else if (key === "name") {
+        // 標題合併：只在「新名合法、且舊名不合法 或 新名更長」時才覆蓋，
+        // 避免 API 返回的類目麵包屑（如 "Mobile & Gadgets-...-Cases"）把 DOM 真標題沖掉
+        const nv = String(value);
+        const tv = String(target[key] || "");
+        if (validateTitle(nv) && (!validateTitle(tv) || nv.length > tv.length)) target[key] = value;
+      }
     }
   }
 
@@ -404,31 +410,120 @@
     return parts.length ? parts.join("，") : "無限制";
   }
 
-  function applySourceFilter(items, filters, log) {
-    const f = filters || {};
-    // 强制过滤：价格200-500、历史销量>0、月銷5-60，不管服务器配什么都覆盖
-    f.priceMin = 200;
-    f.priceMax = 500;
-    f.histMin = 1;
-    f.soldMin = 5;
-    f.soldMax = 60;
-    const hasFilter = ["soldMin", "soldMax", "histMin", "histMax", "priceMin", "priceMax"].some((k) => f[k] !== null && f[k] !== undefined);
-    if (!hasFilter) return items;
-    const kept = items.filter((item) => {
-      const checks = [["soldMin", "sold", "<"], ["soldMax", "sold", ">"], ["histMin", "historical_sold", "<"], ["histMax", "historical_sold", ">"], ["priceMin", "price", "<"], ["priceMax", "price", ">"]];
-      for (const [bound, field, direction] of checks) {
-        const limit = f[bound];
-        if (limit === null || limit === undefined) continue;
-        const raw = item[field];
-        if (raw === null || raw === undefined) return false;
-        // 價格欄存的是 ×100000 原始刻度，換算回 NT$ 再比較
-        const value = field === "price" ? raw / 100000 : raw;
-        if (direction === "<" && value < limit) return false;
-        if (direction === ">" && value > limit) return false;
+  // ===================================================================
+  // 單一職責過濾模塊：每個函數只負責一類判斷，互不污染。
+  // 唯一編排入口是 qualifyItem()，兩條採集鏈路都只調用它；
+  // 改價格只動規則的 priceMin/Max、改銷量只動 soldMin/Max，不會改一處漏一處。
+  // ===================================================================
+
+  // 標題合法性校驗：拒絕類目麵包屑 / 翻譯兜底 / 過短佔位
+  function validateTitle(name) {
+    const n = String(name || "").trim();
+    if (n.length < 4) return false;                        // 太短（含「商品 123456」兜底）
+    if (n.length > 300) return false;
+    if (/[>＞]/.test(n)) return false;                      // 麵包屑分隔符
+    if (/[&-].*[&-]/.test(n)) return false;                 // 同時含 & 與 - 的導航串
+    if (/^(商品|Product)\s*\d{4,}/.test(n)) return false;   // 「商品 123456」佔位
+    if (/Cases,?\s*Covers|Accessories-Cases|Comprehensive Analysis|Tops-Shirts|Women Clothes|Mobile & Gadgets/i.test(n)) return false; // 已知麵包屑樣式
+    return true;
+  }
+
+  // 核心詞：去掉修飾（免運/臺灣出貨/百搭/需搭配/進口/韓國/『ATC』等），只留商品名詞
+  function coreKeyword(kw) {
+    return String(kw || "")
+      .replace(/[『』「」""''【】()（）]/g, " ")
+      .replace(/(免運|免費運費|臺灣出貨|台灣出貨|進口|百搭造型|百搭|需搭配鞋|需搭配|韓國|韓|海外|熱賣|新款|秋冬|春夏|女款|男款|男女款|爆款|包郵|直郵|現貨)/gi, " ")
+      .split(/[\s,，、/]+/).map((s) => s.trim()).filter(Boolean);
+  }
+
+  // 性別/稱謂正規化：男款/男士/男仕→男裝，女款/女仕/女生→女裝，縮小「男士長袖」與「男裝長袖」措辭差
+  function normKeyword(s) {
+    return String(s || "")
+      .replace(/男款|男士|男仕/g, "男裝")
+      .replace(/女款|女仕|女生/g, "女裝");
+  }
+
+  // 關鍵詞相關性：商品名須「完整包含」當前搜索核心詞（搜什麼只採什麼，可預測、不誤收異類）
+  function matchKeyword(name, keyword) {
+    const tokens = coreKeyword(keyword).filter((t) => t.length >= 2);
+    if (!tokens.length) return true;                        // 沒有效核心詞則不強制相關
+    const n = normKeyword(String(name || "").toLowerCase());
+    for (const t of tokens) {
+      if (n.includes(normKeyword(t.toLowerCase()))) return true;
+    }
+    return false;
+  }
+
+  // 唯一編排入口：按順序串起各單一職責模塊，返回 {pass, reason}
+  function qualifyItem(item, rules) {
+    const r = rules || {};
+    if (r.checkTitle !== false && !validateTitle(item.name)) return { pass: false, reason: "標題非法(麵包屑/兜底)" };
+    if (r.keyword) {
+      if (!matchKeyword(item.name, r.keyword)) return { pass: false, reason: `與關鍵詞「${r.keyword}」不相關` };
+    }
+    const priceNt = (item.price !== undefined && item.price !== null) ? Number(item.price) / 100000 : null;
+    if (r.priceMin !== null && r.priceMin !== undefined) {
+      if (priceNt === null) return { pass: false, reason: "無價格" };
+      if (priceNt < r.priceMin) return { pass: false, reason: `價格<${r.priceMin}` };
+    }
+    if (r.priceMax !== null && r.priceMax !== undefined) {
+      if (priceNt === null) return { pass: false, reason: "無價格" };
+      if (priceNt > r.priceMax) return { pass: false, reason: `價格>${r.priceMax}` };
+    }
+    const s = (item.sold !== undefined && item.sold !== null) ? Number(item.sold) : null;
+    if (r.soldMin !== null && r.soldMin !== undefined) {
+      if (s === null) return { pass: false, reason: "無月銷" };
+      if (s < r.soldMin) return { pass: false, reason: `月銷<${r.soldMin}` };
+    }
+    if (r.soldMax !== null && r.soldMax !== undefined) {
+      if (s === null) return { pass: false, reason: "無月銷" };
+      if (s > r.soldMax) return { pass: false, reason: `月銷>${r.soldMax}` };
+    }
+    const h = (item.historical_sold !== undefined && item.historical_sold !== null) ? Number(item.historical_sold) : null;
+    if (r.histMin !== null && r.histMin !== undefined) {
+      if (h === null) return { pass: false, reason: "無總銷" };
+      if (h < r.histMin) return { pass: false, reason: `總銷<${r.histMin}` };
+    }
+    if (r.histMax !== null && r.histMax !== undefined) {
+      if (h === null) return { pass: false, reason: "無總銷" };
+      if (h > r.histMax) return { pass: false, reason: `總銷>${r.histMax}` };
+    }
+    // 無信號過濾：月銷/總銷/評分全為 0（空數據行）→ 拒，避免「為什麼採進來」的噪音
+    if (r.rejectNoSignal) {
+      const rt = (item.rating_star !== undefined && item.rating_star !== null) ? Number(item.rating_star) : 0;
+      if (s === 0 && h === 0 && rt === 0) return { pass: false, reason: "全空數據(無銷量無評分)" };
+    }
+    if (r.checkShop) {
+      if (/代購|代购/.test(item.name || "")) return { pass: false, reason: "代購" };
+      if (brandSheetHit(item.name)) return { pass: false, reason: "品牌詞" };
+      if (bannedKeywordHit(item.name)) return { pass: false, reason: "違規類目" };
+      const basic = r.apiItem || null;
+      if (basic) {
+        if (basic.is_official_shop) return { pass: false, reason: "商城/官方店" };
+        if (basic.brand && basic.brand.name) { rememberBrandItem(item.itemid, item.shopid, basic.brand.name); return { pass: false, reason: "品牌商品" }; }
+        for (const k of Object.keys(basic)) if (/preferred/i.test(k) && basic[k]) return { pass: false, reason: "蝦皮優選" };
       }
-      return true;
-    });
-    log(`   源頭過濾：${items.length} 個中 ${kept.length} 個符合條件`);
+    }
+    if (r.deliveryMode === "tw" && r.deliveryOk === false) return { pass: false, reason: "快速到貨" };
+    return { pass: true, reason: "" };
+  }
+
+  function applySourceFilter(items, filters, log) {
+    // 同步/到期模式：價格 200-500、總銷≥1、月銷 5-60（寫死下限保基礎質量），統一走 qualifyItem
+    const rules = {
+      priceMin: 200, priceMax: 500,
+      histMin: 1, soldMin: 5, soldMax: 60,
+      rejectNoSignal: false,   // 同步模式保留舊行為：不強制信號門檻
+      checkShop: false, checkBrand: false,
+      keyword: null, deliveryMode: null,
+    };
+    const kept = [];
+    for (const item of items) {
+      const res = qualifyItem(item, rules);
+      if (res.pass) kept.push(item);
+      else if (log) log(`   源頭過濾跳過「${(item.name || "").slice(0, 14)}…」：${res.reason}`);
+    }
+    if (log) log(`   源頭過濾：${items.length} 個中 ${kept.length} 個符合條件`);
     return kept;
   }
 
@@ -1519,6 +1614,7 @@
         const parsed = parseCard(a);
         if (!parsed || seenCard.has(parsed.itemid)) continue;
         seenCard.add(parsed.itemid);
+        if (!validateTitle(parsed.name)) { selLog(log, `   跳過「${(parsed.name || "").slice(0, 14)}…」：標題非法(麵包屑/兜底)`); continue; }
         const container = a.closest("li") || a.closest('[data-sqe="link"]') || a.parentElement;
         if (/代購|代购/.test(parsed.name || "")) { selLog(log, `   跳過「${(parsed.name || "").slice(0, 14)}…」：代購商品`); continue; }
         const bannedHit = bannedKeywordHit(parsed.name);
@@ -1614,7 +1710,12 @@
       setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(nextKw)}`; }, 3000);
       return;
     }
-    // 所有關鍵詞都跑完了 → 從服務器拉最新Top20爆款，重新開始輪詢
+    // 所有關鍵詞都跑完了：預設不自動擴詞，停止採集（避免採進用戶沒填的詞）。
+    // 僅當 sel.autoExpand===true 才從工作台拉 Top20 爆款繼續輪詢。
+    if (!sel || sel.autoExpand !== true) {
+      selLog(log, "✅ 所有關鍵詞已採集完畢，停止（未啟用自動擴詞，不會採入未填的詞）");
+      return;
+    }
     selLog(log, `🔄 全部跑完，正在從服務器拉最新Top20爆款…`);
     if (sel) {
       const settings0 = loadSettings();
@@ -1829,33 +1930,22 @@
     });
     const apiMap = buildApiItemMap();
     const items = [...seen.values()].filter((item) => {
-      if (/代購|代购/.test(item.name || "")) return false;
-      if (brandSheetHit(item.name)) return false;
-      if (bannedKeywordHit(item.name)) return false;
-      if (sel.mode === "tw" && deliveryOk.size && deliveryOk.get(Number(item.itemid)) !== true) return false;
-      const basic = apiMap.get(Number(item.itemid));
-      if (sel.min > 0 || sel.maxPrice > 0) {
-        const priceNt = item.price !== undefined && item.price !== null ? Number(item.price) / 100000 : null;
-        if (priceNt === null) return false; // 設了價格帶卻拿不到價格（發票專拍/變體未解析等）→ 直接拒，與 sold 同口徑（fail-closed），防止無價商品漏進庫
-        if (sel.min > 0 && priceNt < sel.min) return false;
-        if (sel.maxPrice > 0 && priceNt > sel.maxPrice) return false;
-      }
-      if (sel.minSold > 0 || sel.maxSold > 0) {
-        const soldN = item.sold !== undefined && item.sold !== null ? Number(item.sold) : null;
-        if (soldN === null) return false;
-        if (sel.minSold > 0 && soldN < sel.minSold) return false;
-        if (sel.maxSold > 0 && soldN > sel.maxSold) return false;
-      }
-      if (basic) {
-        if (basic.is_official_shop) return false;
-        if (basic.brand && basic.brand.name) {
-          rememberBrandItem(basic.itemid, basic.shopid, basic.brand.name);
-          return false;
-        }
-        for (const key of Object.keys(basic)) {
-          if (/preferred/i.test(key) && basic[key]) return false;
-        }
-      }
+      const basic = apiMap.get(Number(item.itemid)) || null;
+      // 唯一編排入口：標題合法 + 關鍵詞相關 + 價格/銷量/總銷 + 拒全空數據 + 店鋪類型 + 配送
+      const res = qualifyItem(item, {
+        keyword: sel.kw,                                                          // 搜什麼就只採什麼（搜衣服直采衣服）
+        priceMin: sel.min > 0 ? sel.min : null,
+        priceMax: sel.maxPrice > 0 ? sel.maxPrice : null,
+        soldMin: sel.minSold > 0 ? sel.minSold : null,
+        soldMax: sel.maxSold > 0 ? sel.maxSold : null,
+        histMin: null, histMax: null,
+        rejectNoSignal: true,                                                     // 全空數據（無銷量無評分）不採
+        checkShop: true, checkBrand: true,
+        apiItem: basic,
+        deliveryMode: sel.mode === "tw" ? "tw" : null,
+        deliveryOk: sel.mode === "tw" && deliveryOk.size ? (deliveryOk.get(Number(item.itemid)) === true) : true,
+      });
+      if (!res.pass) { selLog(log, `   跳過「${(item.name || "").slice(0, 14)}…」：${res.reason}`); return false; }
       return true;
     });
     if (!items.length) {
@@ -1970,7 +2060,7 @@
     ensureBrandMemoryLoaded();
     selLog(log, `🏷️ 品牌記憶：共 ${brandMemoryIds.size} 個品牌商品，本次合併新增 ${brandNew} 個`);
     try {
-      const state = { kw: kw, kwList: kwList, kwIndex: 0, min, maxPrice, minSold, maxSold, maxStores, minPage, maxPages, loc, mode, page: 1, pagesUsed: 0, pendingCards: [], visitedShops: [], visitedShopIds: [], storesDone: 0, phase: "search", refilteredCurrent: false };
+      const state = { kw: kw, kwList: kwList, kwIndex: 0, min, maxPrice, minSold, maxSold, maxStores, minPage, maxPages, loc, mode, page: 1, pagesUsed: 0, pendingCards: [], visitedShops: [], visitedShopIds: [], storesDone: 0, phase: "search", refilteredCurrent: false, autoExpand: false };
       saveSelectState(state);
       tabStore.setItem(SELECT_FLAG, "1");
       state.running = true;
@@ -2088,7 +2178,7 @@
   "use strict";
   var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
   var BEAT_MS = 10000;
-  var VERSION = "sel-4.2.12";
+  var VERSION = "sel-4.2.13";
   var SRC = {
     status: "sp_crawler_status_v14",
     selectState: "sp_select_state_v1",
