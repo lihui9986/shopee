@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.13（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.14（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.13
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題
+// @version      4.2.14
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -12,6 +12,24 @@
 // @updateURL    https://raw.githubusercontent.com/lihui9986/shopee/main/shopee-selector.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihui9986/shopee/main/shopee-selector.user.js
 // ==/UserScript==
+
+/* ============================================================================
+ * 模塊索引（v4.2.14 · 單一職責 · 互不干擾）
+ * 每個功能一個 MODULE，模塊間只通過明確函數接口交互，不直接改對方內部狀態。
+ *   1. Meta/Config       元信息、常量、配置讀寫
+ *   2. NetCapture        網絡鉤子、服務器調用、商品/詳情捕獲
+ *   3. Parse             卡片解析、標題提取、合併
+ *   4. Filter            ★ 單一職責子過濾 + 唯一編排 qualifyItem
+ *   5. Memory            品牌記憶、店鋪記憶、失敗店鋪
+ *   6. SelectFSM         選品狀態機（search→product→shop→next）
+ *   7. SearchEmptyGuard  ★ 搜索連續 0 結果保護（新增）
+ *   8. LoopGuard         打轉死循環修復（失敗店記憶/連敗熔斷/零店數保險絲）
+ *   9. Watchdog          白屏自愈 / 凍結檢測
+ *  10. ProduceReporter    ★ 產出計數上報（新增，供監控零產出檢測）
+ *  11. Heartbeat         心跳上報（hidden/visibility/produced）
+ *  12. SyncMode          同步/到期模式（抓當前店）
+ * 各 MODULE 在下方以「// ===== MODULE: 名稱 =====」標註。
+ * ========================================================================== */
 
 (function () {
   "use strict";
@@ -32,6 +50,7 @@
   const state = { running: false };
   const captured = { shopBases: [], items: [], itemDetails: new Map() };
 
+  // ===== MODULE 9: Watchdog 看門狗（白屏自愈/凍結檢測） =====
   // 看门狗：7分钟无任何进展（无日志/无出卡/无入库/无状态变化）就发邮件+自动刷新。
   // 進展判定：touch()（出卡片/入库成功/setStatus）+ 每條面板日誌。掛死的 await 既無日志也無狀態變化 → 準時開火。
   // 30 分鐘內反覆凍結 3 次則停止自動恢復並告警（防毒頁面無限刷新循環）。
@@ -174,6 +193,8 @@
     return { items: out };
   }
 
+  // ===== MODULE 2: NetCapture 網絡捕獲（鉤子/服務器調用/商品詳情） =====
+  // 職責：攔截 Shopee API、向 4180/4181 發請求、捕獲商品與詳情；不含解析/過濾邏輯
   function installHooks() {
     if (window.__spHooksInstalled) return;
     window.__spHooksInstalled = true;
@@ -237,6 +258,7 @@
     return m ? Number(m[1]) : null;
   }
 
+  // ===== MODULE 3: Parse 解析（卡片/標題/合併） =====
   function parseCard(a) {
     const href = a.getAttribute("href") || "";
     const m = href.match(/-i\.(\d+)\.(\d+)/);
@@ -535,6 +557,7 @@
         body: JSON.stringify({ token: loadSettings().token, crawledAt: new Date().toISOString(), shops, sourceTag: sourceTag || "" }),
       });
       log(`✅ 已入庫：批次 #${result.runId}，${result.shops} 店鋪 / ${result.products} 商品`);
+      ProduceReporter.onProduced(result.products);   // ★ 產出上報（供監控零產出檢測）
       if (result.duplicates) log(`⚠️ 提醒：其中 ${result.duplicates} 個商品之前已採集過，本次記錄為最新批次`);
       // 數據已交給工作台，釋放捕獲包，避免同一頁面連續任務時內存持續堆積
       //（已合併進 seen 的輕量商品對象由 seen 持有，不受清空影響；後續流程都用跳頁，會重新捕獲）
@@ -966,6 +989,8 @@
   }
 
   function selLog(log, text) { log(text); dbgLog(text); }
+  // ===== MODULE 6: SelectFSM 選品狀態機（關鍵詞→搜索→商品→進店→下一個） =====
+  // 職責：協調選品採集全流程；僅調用 Filter/Memory/SearchEmptyGuard/LoopGuard 等模塊，不直接實現過濾/記憶邏輯
   // ==================== 選品模式（關鍵詞→搜索→最後頁向前→進店採集） ====================
   // 遠程調試通道：選品日誌同步到本機調試服務，管理員可實時觀察並下發檢測指令
   let dbgQueue = [];
@@ -1330,6 +1355,7 @@
     saveShopMemory(list);
   }
 
+  // ===== MODULE 5: Memory 記憶（品牌/店鋪/失敗店） =====
   // ==================== 品牌記憶：確認過的品牌商品，下次選品在搜索頁就直接跳過 ====================
   // 本地 localStorage 存檔 + 服務器 /api/profit/select-brand-memory 同步（跨設備有效，180 天窗口）
   const BRAND_MEMORY_KEY = "sp_sel_brand_memory";
@@ -1634,7 +1660,18 @@
       } catch (_) {}
     }
     selLog(log, `   本頁符合條件商品：${pending.length} 個`);
-    if (!pending.length) { sel.refilteredCurrent = true; await selectModeNextPage(sel, log); return; }
+    if (!pending.length) {
+      sel.refilteredCurrent = true;
+      // ★ SearchEmptyGuard：本頁 0 合格商品，累計空頁；連續超限則跳過該關鍵詞（防空轉）
+      if (SearchEmptyGuard.onEmptyPage(sel.kw)) {
+        selLog(log, `⏭ 關鍵詞「${sel.kw}」連續 ${SearchEmptyGuard.LIMIT} 頁 0 合格商品，跳過該詞（防空轉）`);
+        SearchEmptyGuard.reset(sel.kw);
+        selectModeFinish(log);
+        return;
+      }
+      await selectModeNextPage(sel, log);
+      return;
+    }
     sel.pendingCards = pending;
     sel.phase = "product";
     saveSelectState(sel);
@@ -1642,6 +1679,24 @@
     await humanSleep(3200);
     location.href = pending[0];
   }
+  // ===== MODULE 7: SearchEmptyGuard 搜索空結果保護（獨立·不依賴其他模塊內部狀態） =====
+  // 職責：某關鍵詞連續 N 頁搜不到任何合格商品 → 觸發跳詞，避免腳本在 search 階段空轉（假採集中）
+  // 接口：onEmptyPage(kw) 返回 true=應跳詞；reset(kw)；LIMIT 閾值
+  const SearchEmptyGuard = (function () {
+    const LIMIT = 3;                 // 連續 3 頁 0 合格商品即跳過該關鍵詞
+    const emptyCount = {};
+    return {
+      LIMIT: LIMIT,
+      onEmptyPage(kw) {
+        if (!kw) return false;
+        emptyCount[kw] = (emptyCount[kw] || 0) + 1;
+        return emptyCount[kw] >= LIMIT;
+      },
+      reset(kw) { if (kw) emptyCount[kw] = 0; },
+      clear() { for (const k in emptyCount) delete emptyCount[k]; }
+    };
+  })();
+
   async function selectModeNextPage(sel, log) {
     if (!state.running) { selLog(log, sel.paused ? "⏸ 已暫停，任務保留" : "⏹ 已停止"); return; }
     if (sel.storesDone >= sel.maxStores) { selectModeFinish(log); return; }
@@ -1690,6 +1745,7 @@
       // 還有下一個關鍵詞，自動切換
       const nextKw = kwList[kwIndex + 1];
       selLog(log, `\n🎯 關鍵詞「${sel.kw}」採集完畢，自動切換下一個：「${nextKw}」`);
+      SearchEmptyGuard.reset(nextKw);   // ★ 切到新詞時重置空頁計數
       sel.kwIndex = kwIndex + 1;
       sel.kw = nextKw;
       sel.page = 1;
@@ -1895,6 +1951,7 @@
     }
     if (!username) {
       selLog(log, "⚠️ 沒拿到賣場名稱，跳下一個商品");
+      // ===== MODULE 8: LoopGuard 打轉死循環修復 =====
       // 記錄失敗店鋪 + 連敗計數：防止同一 broken 店被反覆重進（打轉死循環根因）
       sel.failedShops = sel.failedShops || [];
       if (sel.failedShops.length > 40) sel.failedShops.splice(0, sel.failedShops.length - 40);
@@ -2178,7 +2235,7 @@
   "use strict";
   var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
   var BEAT_MS = 10000;
-  var VERSION = "sel-4.2.13";
+  var VERSION = "sel-4.2.14";
   var SRC = {
     status: "sp_crawler_status_v14",
     selectState: "sp_select_state_v1",
@@ -2195,6 +2252,17 @@
     lastStatus: "sp_monitor_last_status",
     builtin: "sp_selector_heartbeat_on"
   };
+
+  // ===== MODULE 10: ProduceReporter 產出上報（獨立·僅累積計數與時間戳） =====
+  // 職責：累積本標籤產出商品數與最近產出時間，snapshot() 給 Heartbeat 上報，供 monitor.py 零產出檢測
+  // 接口：onProduced(n) / snapshot() -> {produced, last_ts}
+  const ProduceReporter = (function () {
+    let count = 0, lastTs = 0;
+    return {
+      onProduced(n) { n = Number(n) || 0; if (n > 0) { count += n; lastTs = Date.now(); } },
+      snapshot() { return { produced: count, last_ts: lastTs }; }
+    };
+  })();
 
   function store() { try { return window.sessionStorage; } catch (e) { return null; } }
   function read(key) {
@@ -2245,6 +2313,7 @@
     } catch (e) {}
   });
 
+  // ===== MODULE 11: Heartbeat 心跳上報 =====
   // —— 只讀取選品腳本自己寫的狀態（與監控探針同一口徑）——
   function collect() {
     var statusText = read(SRC.status);
@@ -2291,7 +2360,9 @@
       visibility: document.visibilityState || "",
       queue_left: queueLeft,
       page: location.href.slice(0, 500),
-      probe_version: VERSION
+      probe_version: VERSION,
+      produced: (ProduceReporter.snapshot().produced) || 0,
+      last_produced_ts: (ProduceReporter.snapshot().last_ts) || 0
     };
     if (lastError && Date.now() - lastErrorAt < 120000) payload.error = lastError;
     return payload;
