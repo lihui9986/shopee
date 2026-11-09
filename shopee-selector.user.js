@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.11（台灣/海外雙選品）
+// @name         蝦皮選品器 4.2.12（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.11
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）；看門狗進化（日誌/狀態變化算進展、7 分鐘無進展自動刷新恢復、30 分鐘內反覆凍結 3 次停止恢復並告警）；選品價格過濾 fail-closed（設了價格帶卻無價格的商品直接拒，防發票專拍等無價商品入庫）；打轉死循環修復（失敗賣場記憶跳過＋連敗 10 店熔斷跳頁＋看門狗 30 分鐘零店數保險絲自動回搜索頁）
+// @version      4.2.12
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）；看門狗進化（日誌/狀態變化算進展、7 分鐘無進展自動刷新恢復、30 分鐘內反覆凍結 3 次停止恢復並告警）；選品價格過濾 fail-closed（設了價格帶卻無價格的商品直接拒，防發票專拍等無價商品入庫）；打轉死循環修復（失敗賣場記憶跳過＋連敗 10 店熔斷跳頁＋看門狗 30 分鐘零店數保險絲自動回搜索頁）；心跳上報標籤可見狀態（後台休眠不誤報卡住）；前台白屏 60 秒自動刷新（替代 7 分鐘看門狗）；fetch 鉤子容錯（網絡中止不誤報崩潰）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -75,6 +75,21 @@
     sendNotify("⚠️ 脚本卡住了", `已 ${Math.round(idle/60)} 分钟无任何进展，自动刷新页面恢复（30分钟内第 ${fires.n} 次）。\n页面: ${location.href.slice(0, 120)}\n时间: ` + new Date().toLocaleString());
     setTimeout(() => location.reload(), 5000);
   }, 30000); // 每30秒检查一次
+
+  // 白屏快速自愈（C 檔）：前台 + 採集中 + 關鍵容器長時間缺失 → 60 秒內主動刷新（替代 7 分鐘看門狗的長等待）
+  let blankSince = 0;
+  setInterval(() => {
+    if (document.hidden) { blankSince = 0; return; }                 // 後台不判（後台凍結屬正常）
+    if (!(tabStore.getItem(SELECT_FLAG) || tabStore.getItem(AUTO_KEY) || state.running)) { blankSince = 0; return; }
+    if (document.readyState !== "complete") return;
+    var rendered = document.querySelector("#main, .shopee-search-result, .shop-page, .product-detail, .shopee-page-controller, .portable-shop");
+    if (rendered) { blankSince = 0; return; }                        // 已渲染，正常
+    if (!blankSince) { blankSince = Date.now(); return; }
+    if (Date.now() - blankSince > 60000) {
+      sendNotify("⚠️ 頁面空白", "前台採集中檢測到頁面 60 秒未渲染關鍵內容，自動刷新恢復…\n頁面: " + location.href.slice(0, 120) + "\n時間: " + new Date().toLocaleString());
+      setTimeout(() => location.reload(), 1000);
+    }
+  }, 10000);
 
   function loadSettings() {
     let s = {};
@@ -2073,7 +2088,7 @@
   "use strict";
   var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
   var BEAT_MS = 10000;
-  var VERSION = "sel-4.2.11";
+  var VERSION = "sel-4.2.12";
   var SRC = {
     status: "sp_crawler_status_v14",
     selectState: "sp_select_state_v1",
@@ -2126,7 +2141,10 @@
   window.addEventListener("unhandledrejection", function (ev) {
     try {
       var r = ev.reason;
-      lastError = "💥 未處理異常: " + String((r && (r.stack || r.message)) || r).slice(0, 300);
+      var msg = String((r && (r.stack || r.message)) || r);
+      // 網絡中止/導航取消（Failed to fetch / NetworkError / aborted）是 Shopee 正常行為，不算腳本崩潰，跳過以免誤報
+      if (/Failed to fetch|NetworkError|The user aborted|net::ERR/i.test(msg)) return;
+      lastError = "💥 未處理異常: " + msg.slice(0, 300);
       lastErrorAt = Date.now();
     } catch (e) {}
   });
@@ -2179,6 +2197,8 @@
       progress: progress,
       running: running,
       idle_sec: idleSec,
+      hidden: document.hidden ? 1 : 0,
+      visibility: document.visibilityState || "",
       queue_left: queueLeft,
       page: location.href.slice(0, 500),
       probe_version: VERSION
