@@ -128,7 +128,7 @@
       const basic = entry && (entry.item_basic || entry);
       if (!basic || basic.itemid === undefined) continue;
       const keep = {};
-      for (const key of ["itemid", "shopid", "name", "price", "sold", "historical_sold", "stock", "liked_count", "image", "ctime", "t_ctime", "rating_star", "is_official_shop", "brand", "url"]) {
+      for (const key of ["itemid", "shopid", "name", "price", "sold", "historical_sold", "stock", "liked_count", "image", "ctime", "t_ctime", "rating_star", "item_rating", "is_official_shop", "brand", "url"]) {
         if (basic[key] !== undefined && basic[key] !== null) keep[key] = basic[key];
       }
       for (const key of Object.keys(basic)) {
