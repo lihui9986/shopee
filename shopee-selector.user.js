@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.9（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.10（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.9
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）；看門狗進化（日誌/狀態變化算進展、7 分鐘無進展自動刷新恢復、30 分鐘內反覆凍結 3 次停止恢復並告警）
+// @version      4.2.10
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）；看門狗進化（日誌/狀態變化算進展、7 分鐘無進展自動刷新恢復、30 分鐘內反覆凍結 3 次停止恢復並告警）；選品價格過濾 fail-closed（設了價格帶卻無價格的商品直接拒，防發票專拍等無價商品入庫）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -1781,10 +1781,9 @@
       const basic = apiMap.get(Number(item.itemid));
       if (sel.min > 0 || sel.maxPrice > 0) {
         const priceNt = item.price !== undefined && item.price !== null ? Number(item.price) / 100000 : null;
-        if (priceNt !== null) {
-          if (sel.min > 0 && priceNt < sel.min) return false;
-          if (sel.maxPrice > 0 && priceNt > sel.maxPrice) return false;
-        }
+        if (priceNt === null) return false; // 設了價格帶卻拿不到價格（發票專拍/變體未解析等）→ 直接拒，與 sold 同口徑（fail-closed），防止無價商品漏進庫
+        if (sel.min > 0 && priceNt < sel.min) return false;
+        if (sel.maxPrice > 0 && priceNt > sel.maxPrice) return false;
       }
       if (sel.minSold > 0 || sel.maxSold > 0) {
         const soldN = item.sold !== undefined && item.sold !== null ? Number(item.sold) : null;
@@ -2033,7 +2032,7 @@
   "use strict";
   var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
   var BEAT_MS = 10000;
-  var VERSION = "sel-4.2.9";
+  var VERSION = "sel-4.2.10";
   var SRC = {
     status: "sp_crawler_status_v14",
     selectState: "sp_select_state_v1",
