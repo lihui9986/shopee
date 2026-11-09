@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.8（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.9（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.8
+// @version      4.2.9
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）；看門狗進化（日誌/狀態變化算進展、7 分鐘無進展自動刷新恢復、30 分鐘內反覆凍結 3 次停止恢復並告警）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -120,6 +120,28 @@
     if (arr.length > cap) arr.splice(0, arr.length - cap);
   }
 
+  // 前端瘦身：截獲響應包後立即抽出下游真正消費的最小字段集（入庫 12 字段 + 選品需要的品牌/商城/優選標誌），
+  // 大包當場丟棄交給 GC。下游 mergeApiItems/buildApiItemMap 消費 entry.item_basic，形狀不變。
+  function compactSearchBody(body) {
+    const out = [];
+    for (const entry of (body && body.items) || []) {
+      const basic = entry && (entry.item_basic || entry);
+      if (!basic || basic.itemid === undefined) continue;
+      const keep = {};
+      for (const key of ["itemid", "shopid", "name", "price", "sold", "historical_sold", "stock", "liked_count", "image", "ctime", "t_ctime", "rating_star", "is_official_shop", "brand", "url"]) {
+        if (basic[key] !== undefined && basic[key] !== null) keep[key] = basic[key];
+      }
+      for (const key of Object.keys(basic)) {
+        if (/preferred/i.test(key) && basic[key]) keep[key] = basic[key];
+      }
+      if (keep.image === undefined && entry.image) keep.image = entry.image;
+      if (keep.url === undefined && keep.shopid && keep.itemid) keep.url = `https://shopee.tw/product-i.${keep.shopid}.${keep.itemid}`;
+      if (keep.name !== undefined && typeof keep.name === "string") keep.name = keep.name.slice(0, 300);
+      out.push({ item_basic: keep });
+    }
+    return { items: out };
+  }
+
   function installHooks() {
     if (window.__spHooksInstalled) return;
     window.__spHooksInstalled = true;
@@ -132,7 +154,7 @@
         try {
           const url = String((args[0] && args[0].url) || args[0] || "");
           if (url.includes("/api/v4/shop/get_shop_base")) pushCapped(captured.shopBases, await response.clone().json(), 20);
-          else if (url.includes("/api/v4/shop/search_items")) pushCapped(captured.items, await response.clone().json(), 160);
+          else if (url.includes("/api/v4/shop/search_items")) pushCapped(captured.items, compactSearchBody(await response.clone().json()), 160);
           else if (url.includes("/api/v4/pdp/get_pc") || url.includes("/api/v4/item/get")) captureItemDetail(await response.clone().json());
         } catch (_) { /* 忽略 */ }
         return response;
@@ -149,7 +171,7 @@
         try {
           if (!this.__spUrl) return;
           if (this.__spUrl.includes("/api/v4/shop/get_shop_base")) pushCapped(captured.shopBases, JSON.parse(this.responseText), 20);
-          else if (this.__spUrl.includes("/api/v4/shop/search_items")) pushCapped(captured.items, JSON.parse(this.responseText), 160);
+          else if (this.__spUrl.includes("/api/v4/shop/search_items")) pushCapped(captured.items, compactSearchBody(JSON.parse(this.responseText)), 160);
           else if (this.__spUrl.includes("/api/v4/pdp/get_pc") || this.__spUrl.includes("/api/v4/item/get")) captureItemDetail(JSON.parse(this.responseText));
         } catch (_) { /* 忽略 */ }
       });
@@ -281,9 +303,12 @@
     mergeCursors.set(seen, captured.items.length);
   }
 
+  const domParsed = new WeakSet();
   function scrapeDomInto(seen) {
     document.querySelectorAll('a[href*="-i."]').forEach((a) => {
       try {
+        if (domParsed.has(a)) return;
+        domParsed.add(a);
         const card = parseCard(a);
         if (!card) return;
         const existing = seen.get(card.itemid);
@@ -294,7 +319,7 @@
   }
 
   function findSortTab(label) {
-    const elements = document.querySelectorAll('button, a, div[role="button"], span, div');
+    const elements = document.querySelectorAll('button, a, span, div[role="button"]');
     for (const el of elements) {
       if (el.childElementCount === 0 && el.textContent.trim() === label) return el;
     }
@@ -868,7 +893,7 @@
         dbgPost("/result", { id: raw.id, result: result.slice(0, 7000) });
       }
       // 成功 400ms 輪詢；失敗/超時退避 5s，避免工作台關閉時高頻空打
-      await sleep(raw ? 400 : 5000);
+      await sleep(raw ? 3000 : 5000);
     }
   }
 
@@ -2008,7 +2033,7 @@
   "use strict";
   var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
   var BEAT_MS = 10000;
-  var VERSION = "sel-4.2.7";
+  var VERSION = "sel-4.2.9";
   var SRC = {
     status: "sp_crawler_status_v14",
     selectState: "sp_select_state_v1",
