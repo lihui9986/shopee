@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.7（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.8（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.7
+// @version      4.2.8
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；源頭過濾；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶（先查記憶直接跳過品牌，進店前再確認一次並記錄）；內建 4181 採集監控心跳（三標籤獨立上報，無需另裝探針）；採集內存優化（捕獲包限量保留、入庫後釋放、增量合併、日誌上限 200 條）；心跳 idle 以本頁壽命為上限（修復跨頁誤報卡住）；看門狗進化（日誌/狀態變化算進展、7 分鐘無進展自動刷新恢復、30 分鐘內反覆凍結 3 次停止恢復並告警）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -595,7 +595,7 @@
     panel.style.cssText = "position:fixed;top:80px;right:16px;z-index:999999;width:320px;background:#fff;border:2px solid #ee4d2d;border-radius:8px;padding:10px;font:12px/1.5 sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.2)";
     const settings = loadSettings();
     panel.innerHTML =
-      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v4.2.3 · 台灣/海外雙選品</div>' +
+      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v' + (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version ? GM_info.script.version : "4.2.8") + ' · 台灣/海外雙選品</div>' +
       '<input class="sp-server" autocomplete="off" placeholder="工作台地址，其他電腦填 http://伺服器IP:4180" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<input class="sp-token" autocomplete="off" placeholder="連接令牌（工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-auto-check"> 打開蝦皮時自動補抓到期店鋪</label>' +
