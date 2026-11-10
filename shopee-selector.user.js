@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.15（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.16（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.15
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）
+// @version      4.2.16
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -14,7 +14,7 @@
 // ==/UserScript==
 
 /* ============================================================================
- * 模塊索引（v4.2.15 · 單一職責 · 互不干擾）
+ * 模塊索引（v4.2.16 · 單一職責 · 互不干擾）
  * 每個功能一個 MODULE，模塊間只通過明確函數接口交互，不直接改對方內部狀態。
  *   1. Meta/Config       元信息、常量、配置讀寫
  *   2. NetCapture        網絡鉤子、服務器調用、商品/詳情捕獲
@@ -24,9 +24,9 @@
  *   6. SelectFSM         選品狀態機（search→product→shop→next）
  *   7. SearchEmptyGuard  ★ 搜索連續 0 結果保護（新增）
  *   8. LoopGuard         打轉死循環修復（失敗店記憶/連敗熔斷/零店數保險絲）
- *   9. Watchdog          白屏自愈 / 凍結檢測
- *  10. ProduceReporter    ★ 產出計數上報（新增，供監控零產出檢測）
- *  11. Heartbeat         心跳上報（hidden/visibility/produced）
+ *   9. Watchdog          【已移除】自動刷新/白屏自愈/凍結檢測
+ *  10. ProduceReporter    【已移除】產出計數上報（原供監控零產出檢測）
+ *  11. Heartbeat         【已移除】心跳上報（原 4181 監控）
  *  12. SyncMode          同步/到期模式（抓當前店）
  * 各 MODULE 在下方以「// ===== MODULE: 名稱 =====」標註。
  * ========================================================================== */
@@ -50,66 +50,9 @@
   const state = { running: false };
   const captured = { shopBases: [], items: [], itemDetails: new Map() };
 
-  // ===== MODULE 9: Watchdog 看門狗（白屏自愈/凍結檢測） =====
-  // 看门狗：7分钟无任何进展（无日志/无出卡/无入库/无状态变化）就发邮件+自动刷新。
-  // 進展判定：touch()（出卡片/入库成功/setStatus）+ 每條面板日誌。掛死的 await 既無日志也無狀態變化 → 準時開火。
-  // 30 分鐘內反覆凍結 3 次則停止自動恢復並告警（防毒頁面無限刷新循環）。
-  let lastActivity = Date.now();
-  let watchdogNotified = false;
-  function touch() { lastActivity = Date.now(); }
-  const WD_FIRES_KEY = "sp_watchdog_fires_v1";
-  setInterval(() => {
-    // 选品/自动补抓/同步任一進行中都武装（state.running 覆蓋所有模式，含掛在 await 上的流程）
-    const selFlagOn = !!tabStore.getItem(SELECT_FLAG);
-    if (!selFlagOn && !tabStore.getItem(AUTO_KEY) && !state.running) return;
-    // 無生產力保險絲：選品進行中但 30 分鐘店鋪完成數零增長（原地打轉/掛死通殺）→ 回搜索頁重建流程
-    if (selFlagOn) {
-      let prog = null;
-      try { prog = JSON.parse(tabStore.getItem("sp_sel_progress_v1") || "null"); } catch (_) {}
-      let selNow = null;
-      try { selNow = JSON.parse(tabStore.getItem(SELECT_STATE_KEY) || "null"); } catch (_) {}
-      const done = selNow ? (selNow.storesDone || 0) : -1;
-      if (!prog || prog.done !== done) {
-        tabStore.setItem("sp_sel_progress_v1", JSON.stringify({ done: done, ts: Date.now() }));
-      } else if (done >= 0 && Date.now() - (prog.ts || 0) > 30 * 60 * 1000) {
-        tabStore.setItem("sp_sel_progress_v1", JSON.stringify({ done: done, ts: Date.now() }));
-        const kwNow = selNow && selNow.kw ? selNow.kw : "";
-        sendNotify("🔄 選品無進展自動重置", "30 分鐘內店鋪完成數零增長（疑似原地打轉或掛死），自動回搜索頁重建流程。\n時間: " + new Date().toLocaleString());
-        setTimeout(() => { location.href = "https://shopee.tw/search?keyword=" + encodeURIComponent(kwNow); }, 5000);
-      }
-    }
-    const idle = (Date.now() - lastActivity) / 1000;
-    if (idle <= 420 || watchdogNotified) return; // 7分钟
-    watchdogNotified = true;
-    let fires = { n: 0, t: 0 };
-    try { fires = JSON.parse(tabStore.getItem(WD_FIRES_KEY) || '{"n":0,"t":0}') || fires; } catch (_) {}
-    if (Date.now() - (fires.t || 0) > 30 * 60 * 1000) fires = { n: 0, t: 0 };
-    fires.n += 1;
-    fires.t = Date.now();
-    try { tabStore.setItem(WD_FIRES_KEY, JSON.stringify(fires)); } catch (_) {}
-    if (fires.n > 3) {
-      sendNotify("🛑 腳本反覆凍結", `看門狗 30 分鐘內已自動恢復 ${fires.n - 1} 次仍再次凍結，已停止自動刷新，請人工檢查該標籤。\n頁面: ${location.href.slice(0, 120)}\n時間: ` + new Date().toLocaleString());
-      return;
-    }
-    sendNotify("⚠️ 脚本卡住了", `已 ${Math.round(idle/60)} 分钟无任何进展，自动刷新页面恢复（30分钟内第 ${fires.n} 次）。\n页面: ${location.href.slice(0, 120)}\n时间: ` + new Date().toLocaleString());
-    setTimeout(() => location.reload(), 5000);
-  }, 30000); // 每30秒检查一次
-
-  // 白屏快速自愈（C 檔）：前台 + 採集中 + 關鍵容器長時間缺失 → 60 秒內主動刷新（替代 7 分鐘看門狗的長等待）
-  let blankSince = 0;
-  setInterval(() => {
-    if (document.hidden) { blankSince = 0; return; }                 // 後台不判（後台凍結屬正常）
-    if (!(tabStore.getItem(SELECT_FLAG) || tabStore.getItem(AUTO_KEY) || state.running)) { blankSince = 0; return; }
-    if (document.readyState !== "complete") return;
-    var rendered = document.querySelector("#main, .shopee-search-result, .shop-page, .product-detail, .shopee-page-controller, .portable-shop");
-    if (rendered) { blankSince = 0; return; }                        // 已渲染，正常
-    if (!blankSince) { blankSince = Date.now(); return; }
-    if (Date.now() - blankSince > 60000) {
-      sendNotify("⚠️ 頁面空白", "前台採集中檢測到頁面 60 秒未渲染關鍵內容，自動刷新恢復…\n頁面: " + location.href.slice(0, 120) + "\n時間: " + new Date().toLocaleString());
-      setTimeout(() => location.reload(), 1000);
-    }
-  }, 10000);
-
+  // ===== MODULE 9: Watchdog 看門狗 — 已按用戶要求移除（自動刷新/白屏自愈/無進展重置/凍結檢測） =====
+  // 保留 touch() 作為無操作佔位：setStatus / selLog / 採集流程仍呼叫它，但不觸發任何看門狗行為。
+  function touch() {}
   function loadSettings() {
     let s = {};
     try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch (_) {}
@@ -583,7 +526,6 @@
         body: JSON.stringify({ token: loadSettings().token, crawledAt: new Date().toISOString(), shops, sourceTag: sourceTag || "" }),
       });
       log(`✅ 已入庫：批次 #${result.runId}，${result.shops} 店鋪 / ${result.products} 商品`);
-      ProduceReporter.onProduced(result.products);   // ★ 產出上報（供監控零產出檢測）
       if (result.duplicates) log(`⚠️ 提醒：其中 ${result.duplicates} 個商品之前已採集過，本次記錄為最新批次`);
       // 數據已交給工作台，釋放捕獲包，避免同一頁面連續任務時內存持續堆積
       //（已合併進 seen 的輕量商品對象由 seen 持有，不受清空影響；後續流程都用跳頁，會重新捕獲）
@@ -796,7 +738,7 @@
     panel.style.cssText = "position:fixed;top:80px;right:16px;z-index:999999;width:320px;background:#fff;border:2px solid #ee4d2d;border-radius:8px;padding:10px;font:12px/1.5 sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.2)";
     const settings = loadSettings();
     panel.innerHTML =
-      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v' + (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version ? GM_info.script.version : "4.2.15") + ' · 台灣/海外雙選品</div>' +
+      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v' + (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version ? GM_info.script.version : "4.2.16") + ' · 台灣/海外雙選品</div>' +
       '<input class="sp-server" autocomplete="off" placeholder="工作台地址，其他電腦填 http://伺服器IP:4180" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<input class="sp-token" autocomplete="off" placeholder="連接令牌（工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-auto-check"> 打開蝦皮時自動補抓到期店鋪</label>' +
@@ -2249,184 +2191,3 @@
   else window.addEventListener("DOMContentLoaded", buildPanel);
 })();
 
-/* =========================================================================
- * 內建採集監控心跳 v1.0（4181 工作台）  —  追加式，不修改上方任何採集邏輯
- * -------------------------------------------------------------------------
- * · 由選品腳本本體直接上報，不需要另外安裝「選品採集監控探針」。
- * · 每個 shopee 標籤的 sessionStorage 各自獨立 → 後台自動分成三張狀態卡。
- * · 只讀狀態鍵 + POST 到獨立 monitor.db；不寫真庫、不改 4180、不干擾採集。
- * · 回報地址可用 sessionStorage 的 sp_monitor_endpoint 覆蓋；
- *   工作台若設了 ACCESS_KEY / MONITOR_KEY，用 sp_monitor_key 填同一個值。
- * ========================================================================= */
-(function () {
-  "use strict";
-  var DEFAULT_ENDPOINT = "http://192.168.142.111:4181";
-  var BEAT_MS = 10000;
-  var VERSION = "sel-4.2.14";
-  var SRC = {
-    status: "sp_crawler_status_v14",
-    selectState: "sp_select_state_v1",
-    selectFlag: "sp_crawler_select_v1",
-    queue: "sp_crawler_queue_v14",
-    auto: "sp_crawler_auto_v14"
-  };
-  var OWN = {
-    endpoint: "sp_monitor_endpoint",
-    key: "sp_monitor_key",
-    tabId: "sp_monitor_tab_id",
-    label: "sp_monitor_tab_label",
-    lastChange: "sp_monitor_last_change",
-    lastStatus: "sp_monitor_last_status",
-    builtin: "sp_selector_heartbeat_on"
-  };
-
-  // ===== MODULE 10: ProduceReporter 產出上報（獨立·僅累積計數與時間戳） =====
-  // 職責：累積本標籤產出商品數與最近產出時間，snapshot() 給 Heartbeat 上報，供 monitor.py 零產出檢測
-  // 接口：onProduced(n) / snapshot() -> {produced, last_ts}
-  const ProduceReporter = (function () {
-    let count = 0, lastTs = 0;
-    return {
-      onProduced(n) { n = Number(n) || 0; if (n > 0) { count += n; lastTs = Date.now(); } },
-      snapshot() { return { produced: count, last_ts: lastTs }; }
-    };
-  })();
-
-  function store() { try { return window.sessionStorage; } catch (e) { return null; } }
-  function read(key) {
-    var s = store(), v = "";
-    if (s) { try { v = s.getItem(key) || ""; } catch (e) {} }
-    // 相容舊版若狀態寫在 localStorage：仍以 sessionStorage 優先（標籤隔離）
-    if (!v) { try { v = window.localStorage.getItem(key) || ""; } catch (e) {} }
-    return v;
-  }
-  function write(key, value) {
-    var s = store();
-    if (!s) return;
-    try { s.setItem(key, value); } catch (e) {}
-  }
-  function readJSON(key) {
-    try { return JSON.parse(read(key) || "null"); } catch (e) { return null; }
-  }
-  function endpoint() { return (read(OWN.endpoint) || DEFAULT_ENDPOINT).replace(/\/+$/, ""); }
-
-  // 與獨立監控探針共用同一組 tab_id / 標籤名，避免後台出現重複卡片
-  var tabId = read(OWN.tabId);
-  if (!tabId) {
-    tabId = "T" + Date.now().toString(36).toUpperCase() +
-            Math.random().toString(36).slice(2, 6).toUpperCase();
-    write(OWN.tabId, tabId);
-  }
-  var label = read(OWN.label) || ("標籤 " + tabId.slice(-4));
-  write(OWN.label, label);
-  // 若使用者也裝了獨立探針，探針會讓位，避免同一標籤雙重上報
-  write(OWN.builtin, "1");
-
-  var lastError = "", lastErrorAt = 0;
-  var pageStart = Date.now(); // 本頁載入時間：idle 以頁面壽命為上限，防止跨頁誤報
-  window.addEventListener("unhandledrejection", function (ev) {
-    try {
-      var r = ev.reason;
-      var msg = String((r && (r.stack || r.message)) || r);
-      // 網絡中止/導航取消（Failed to fetch / NetworkError / aborted）是 Shopee 正常行為，不算腳本崩潰，跳過以免誤報
-      if (/Failed to fetch|NetworkError|The user aborted|net::ERR/i.test(msg)) return;
-      lastError = "💥 未處理異常: " + msg.slice(0, 300);
-      lastErrorAt = Date.now();
-    } catch (e) {}
-  });
-  window.addEventListener("error", function (ev) {
-    try {
-      lastError = "💥 頁面錯誤: " + String(ev.message || "").slice(0, 300);
-      lastErrorAt = Date.now();
-    } catch (e) {}
-  });
-
-  // ===== MODULE 11: Heartbeat 心跳上報 =====
-  // —— 只讀取選品腳本自己寫的狀態（與監控探針同一口徑）——
-  function collect() {
-    var statusText = read(SRC.status);
-    if (!statusText) {
-      var box = document.querySelector(".sp-status");
-      if (box && box.textContent) statusText = box.textContent.trim().slice(0, 300);
-    }
-    var sel = readJSON(SRC.selectState), phase = "", progress = "";
-    if (sel && typeof sel === "object") {
-      phase = String(sel.phase || "").slice(0, 40);
-      if (sel.storesDone !== undefined && sel.maxStores !== undefined) {
-        progress = sel.storesDone + "/" + sel.maxStores;
-      } else if (sel.page !== undefined && sel.pagesUsed !== undefined) {
-        progress = sel.pagesUsed + "/" + sel.maxPages;
-      }
-    }
-    var queue = readJSON(SRC.queue);
-    var queueLeft = Array.isArray(queue) ? queue.length : 0;
-    var running = !!read(SRC.selectFlag) || !!read(SRC.auto) || queueLeft > 0;
-
-    // 狀態文字多久沒變 → 前端無活動秒數（與選品腳本看門狗同一口徑）
-    var now = Date.now();
-    if (read(OWN.lastStatus) !== statusText) {
-      write(OWN.lastStatus, statusText);
-      write(OWN.lastChange, String(now));
-    }
-    var changed = Number(read(OWN.lastChange) || now);
-    var idleSec = Math.max(0, Math.round((now - changed) / 1000));
-    // lastChange 存在 sessionStorage、跨頁刷新存活：頁面剛載入可能繼承上個頁面的舊時間戳，
-    // 導致 idle 虛高、後台誤判「卡住」。頁面載入本身就是活動 → idle 不得超過本頁壽命。
-    var pageAgeSec = Math.max(0, Math.round((now - pageStart) / 1000));
-    if (idleSec > pageAgeSec) idleSec = pageAgeSec;
-
-    var payload = {
-      tab_id: tabId,
-      label: label,
-      kind: "heartbeat",
-      status_text: statusText.slice(0, 300),
-      phase: phase,
-      progress: progress,
-      running: running,
-      idle_sec: idleSec,
-      hidden: document.hidden ? 1 : 0,
-      visibility: document.visibilityState || "",
-      queue_left: queueLeft,
-      page: location.href.slice(0, 500),
-      probe_version: VERSION,
-      produced: (ProduceReporter.snapshot().produced) || 0,
-      last_produced_ts: (ProduceReporter.snapshot().last_ts) || 0
-    };
-    if (lastError && Date.now() - lastErrorAt < 120000) payload.error = lastError;
-    return payload;
-  }
-
-  // —— 上報（GM 特權請求，不受混合內容限制）——
-  function post(payload) {
-    var key = read(OWN.key);
-    var headers = { "Content-Type": "application/json" };
-    if (key) { headers["X-Monitor-Key"] = key; headers["X-Access-Key"] = key; }
-    try {
-      GM_xmlhttpRequest({
-        method: "POST",
-        url: endpoint() + "/api/monitor/heartbeat",
-        headers: headers,
-        data: JSON.stringify(payload),
-        timeout: 10000,
-        onload: function (res) {
-          if (payload.error && res.status >= 200 && res.status < 300) lastError = "";
-        },
-        onerror: function () {},
-        ontimeout: function () {}
-      });
-    } catch (e) {}
-  }
-
-  function beat() { post(collect()); }
-
-  beat();
-  setInterval(beat, BEAT_MS);
-  document.addEventListener("visibilitychange", function () {
-    if (!document.hidden) beat();
-  });
-  window.addEventListener("pagehide", function () {
-    var p = collect(); p.kind = "offline"; post(p);
-  });
-  try {
-    console.log("[選品監控] 內建心跳已啟動 → " + endpoint() + " · " + tabId + " · " + VERSION);
-  } catch (e) {}
-})();
