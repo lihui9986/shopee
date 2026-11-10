@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.36（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.37（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.36
+// @version      4.2.37
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -749,17 +749,29 @@
   // 性別/稱謂正規化：男款/男士/男仕→男裝，女款/女仕/女生→女裝，縮小「男士長袖」與「男裝長袖」措辭差
   function normKeyword(s) {
     return String(s || "")
-      .replace(/男款|男士|男仕/g, "男裝")
+      .replace(/瑜珈/g, "瑜伽").replace(/男款|男士|男仕/g, "男裝")
       .replace(/女款|女仕|女生/g, "女裝");
   }
 
   // 關鍵詞相關性：商品名須「完整包含」當前搜索核心詞（搜什麼只採什麼，可預測、不誤收異類）
+  // v4.2.37：複合長詞（連帽運動外套／郵差斜挎包）改用「2 字滑窗命中 ≥2」判相關。
+  // 以前整串比對，店內商品叫「連帽外套」不含「連帽運動外套」→ 首屏全部判無關 → 空店止損整店跳過，店內永遠 0 入庫。
   function matchKeyword(name, keyword) {
-    const tokens = coreKeyword(keyword).filter((t) => t.length >= 2);
+    const tokens = coreKeyword(keyword).filter((t) => t.length >= 1);
     if (!tokens.length) return true;                        // 沒有效核心詞則不強制相關
     const n = normKeyword(String(name || "").toLowerCase());
+    if (n.includes(normKeyword(tokens.join("").toLowerCase()))) return true;   // 整串命中
     for (const t of tokens) {
-      if (n.includes(normKeyword(t.toLowerCase()))) return true;
+      const nt = normKeyword(t.toLowerCase());
+      if (nt.length <= 2) {                                 // 短詞（外套／T／包）直接包含
+        if (n.includes(nt)) return true;
+        continue;
+      }
+      let hits = 0;                                         // 長詞：2 字滑窗，命中 ≥2 才算了相關
+      for (let i = 0; i + 2 <= nt.length; i += 1) {
+        if (n.includes(nt.slice(i, i + 2))) hits += 1;
+      }
+      if (hits >= 2) return true;
     }
     return false;
   }
