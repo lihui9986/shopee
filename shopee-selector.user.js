@@ -231,7 +231,7 @@
   const Limits = {
     data: null,
     _loadedAt: 0,
-    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 30, pageHardMax: 200, storeMax: 0 },
+    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 50, pageHardMax: 200, storeMax: 0 },
     async load(log) {
       if (this.data && Date.now() - this._loadedAt < 60000) return this.data;
       try {
@@ -2324,7 +2324,9 @@
     const storeCap = Number(Limits.get("storeMax")) > 0 ? Number(Limits.get("storeMax")) : 9999;
     const maxStores = Math.max(1, Math.min(storeCap, inputNum(".sp-sel-stores", storeCap)));
     const minPage = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-minpage", selGet("minPage", Limits.get("pageMin")))));
-    const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", selGet("maxPages", Limits.get("pageMax")))));
+    // 頁數上限：面板手填 > 服務端模塊（Limits.pageMax）> 本機記憶
+    // （v4.2.27 修正：以前本機記憶優先，面板留空時會沿用上次的舊值 1，模塊改成多少都不生效）
+    const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", Limits.get("pageMax") || selGet("maxPages", 50))));
     const loc = mode === "os" ? "overseas" : "tw";
     if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
     tabStore.setItem("sp_sel_kw", kw.trim());
@@ -2395,7 +2397,7 @@
         return;
       }
       sel.minPage = sel.minPage || 5;
-      sel.maxPages = sel.maxPages || 30;
+      sel.maxPages = sel.maxPages || Limits.get("pageMax") || 50;
       sel.pagesUsed = sel.pagesUsed || 0;
       sel.page = sel.page || 1;
       sel.storesDone = sel.storesDone || 0;
