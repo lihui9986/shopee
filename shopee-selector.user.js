@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.17（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.18（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.17
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）
+// @version      4.2.18
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -14,7 +14,7 @@
 // ==/UserScript==
 
 /* ============================================================================
- * 模塊索引（v4.2.17 · 單一職責 · 互不干擾）
+ * 模塊索引（v4.2.18 · 單一職責 · 互不干擾）
  * 每個功能一個 MODULE，模塊間只通過明確函數接口交互，不直接改對方內部狀態。
  *   1. Meta/Config       元信息、常量、配置讀寫
  *   2. NetCapture        網絡鉤子、服務器調用、商品/詳情捕獲
@@ -359,6 +359,8 @@
       const hdr = document.querySelector(".shop-name, [class*='shop-name'], header h1");
       if (hdr && hdr.textContent) name = hdr.textContent.trim();
     }
+    // v4.2.18：拒絕把站點名當店名（首頁/搜索頁兜底時標題會是「Shopee蝦皮購物」等，不能當賣場采）
+    if (name && /^(shopee|蝦皮購物|蝦皮|shopee\s*蝦皮購物|shopee蝦皮購物|shopee 蝦皮購物)$/i.test(name)) name = "";
     const username = slug || name || "";
     return { shopid, username, name, _domFallback: true };
   }
@@ -738,7 +740,7 @@
     panel.style.cssText = "position:fixed;top:80px;right:16px;z-index:999999;width:320px;background:#fff;border:2px solid #ee4d2d;border-radius:8px;padding:10px;font:12px/1.5 sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.2)";
     const settings = loadSettings();
     panel.innerHTML =
-      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v' + (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version ? GM_info.script.version : "4.2.17") + ' · 台灣/海外雙選品</div>' +
+      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v' + (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version ? GM_info.script.version : "4.2.18") + ' · 台灣/海外雙選品</div>' +
       '<input class="sp-server" autocomplete="off" placeholder="工作台地址，其他電腦填 http://伺服器IP:4180" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<input class="sp-token" autocomplete="off" placeholder="連接令牌（工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-auto-check"> 打開蝦皮時自動補抓到期店鋪</label>' +
@@ -1864,6 +1866,13 @@
     const shopHref = shopAnchor.getAttribute("href");
     const abs = shopHref.startsWith("http") ? shopHref : `https://shopee.tw${shopHref}`;
     const shopUrl = abs.split("?")[0];
+    // ★ v4.2.18：校驗店鋪連結——空 / # / 首頁，視為「查看賣場」失效，跳過換下一個商品
+    // （Shopee 部分商品頁「查看賣場」href 變空/#，若照跳會到首頁、把站名當店鋪採，導致 0 商品）
+    if (!shopUrl || shopUrl.indexOf("#") !== -1 || /^https?:\/\/shopee\.tw\/?$/.test(shopUrl)) {
+      selLog(log, `⚠️ 查看賣場連結無效（${shopUrl || "空"}），跳下一個商品`);
+      await selectModeNextCard(sel, log);
+      return;
+    }
     // 失敗店鋪記憶：剛打不開的店不再反覆進（防止 product↔shop 原地打轉死循環）
     if ((sel.failedShops || []).indexOf(shopUrl) !== -1) {
       selLog(log, "⏭ 該賣場剛才打開失敗，跳過");
