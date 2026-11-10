@@ -2578,6 +2578,10 @@
         return;
       }
       state.running = true;
+      // 整頁跳轉後 setInterval 會消失（只有點開始那次活著）：續跑時重啟心跳，
+      // 否則後台看到的心跳時間永遠停在「開始」那一刻，標籤看起來像卡死，租約也會 30 分鐘後被回收。
+      Worker.keyword = sel.kw || Worker.keyword;
+      Worker.startHeartbeat(60000);
       setStatus(`選品模式：${sel.phase === "search" ? "搜索篩選" : sel.phase === "product" ? "查看商品" : "採集店鋪"}（完成 ${sel.storesDone || 0}/${sel.maxStores}）`);
       selLog(log, `🔁 選品續跑：階段=${sel.phase} 頁=${sel.page} 已完成店鋪=${sel.storesDone || 0}`);
       if (location.pathname.includes("/verify/")) {
