@@ -225,39 +225,6 @@
     },
   };
 
-  // ===== MODULE: ShopUrl 賣場連結解析（空連結兜底） =====
-  // 職責：從商品頁解析「查看賣場」連結。Shopee 常把 href 給成空 / "#" / 首頁，
-  // 舊版（v4.2.18 起）遇到就整條跳過 → 永遠進不了店、長期 0 入庫。
-  // 這裡改為按 shopid 兜底拼 https://shopee.tw/shop/{shopid}，取不到才跳過。
-  const ShopUrl = {
-    _norm(href) {
-      const h = String(href || "").trim();
-      if (!h) return "";
-      const abs = /^https?:/i.test(h) ? h : `https://shopee.tw${h.startsWith("/") ? "" : "/"}${h}`;
-      return abs.split("?")[0];
-    },
-    _valid(url) {
-      return !!url && url.indexOf("#") === -1 && !/^https?:\/\/shopee\.tw\/?$/.test(url);
-    },
-    _shopidFromHref(href) {
-      const m = String(href || "").match(/\/shop\/(\d+)/);
-      return m ? m[1] : "";
-    },
-    _shopidFromPath(pathname) {
-      const m = String(pathname || "").match(/-i\.(\d+)\.(\d+)/);
-      return m ? m[1] : "";
-    },
-    // 返回 { url, shopid, reason }；url 為 "" 表示取不到，呼叫方自行跳過
-    resolve(anchor) {
-      const href = anchor ? (anchor.getAttribute("href") || "") : "";
-      const direct = this._norm(href);
-      if (this._valid(direct)) return { url: direct, shopid: this._shopidFromHref(href), reason: "href" };
-      const shopid = this._shopidFromHref(href) || this._shopidFromPath(location.pathname);
-      if (shopid) return { url: `https://shopee.tw/shop/${shopid}`, shopid, reason: "shopid" };
-      return { url: "", shopid: "", reason: direct ? "首頁或#號" : "空連結" };
-    },
-  };
-
   // ===== MODULE: Limits 選品核心參數（對接服務端 xuanpin_limits 模塊） =====
   // 職責：價格區間、月銷上下限、總銷下限、頁數上下限、店鋪上限全部由服務端模塊給，腳本只讀不寫死。
   // 以後改採多少錢、多少銷量、幾頁：只改 xuanpin_limits.py（或環境變量），腳本和後台自動跟著變。
@@ -1022,37 +989,24 @@
       el.value = v;
     };
     prefill(".sp-sel-kw", "kw", "");
-    prefill(".sp-sel-min", "min", "");
-    prefill(".sp-sel-maxp", "maxPrice", "");
-    prefill(".sp-sel-sold", "minSold", "");
-    prefill(".sp-sel-maxsold", "maxSold", "");
-    prefill(".sp-sel-minpage", "minPage", "", true);
-    prefill(".sp-sel-pages", "maxPages", "", true);
-    // 參數模塊（xuanpin_limits）：價格/銷量/頁數/店鋪上限的默認值全部來自服務端模塊，
-    // 面板留空＝自動帶入模塊值；填了就按填的採（臨時覆蓋，不改模塊）
+    // 參數模塊（xuanpin_limits）：價格/銷量/頁數/店鋪上限的默認值全部來自服務端模塊。
+    // 打開面板一律用模塊值顯示（不回填上次的舊值，避免舊值蓋住模塊默認值）；本次手動改＝本次任務臨時覆蓋。
     const fillLimits = () => {
       const d = Limits.data || Limits.defaults;
-      const setIfEmpty = (cls, val) => {
+      const setVal = (cls, val) => {
         const el = panel.querySelector(cls);
-        if (el && !String(el.value || "").trim() && val !== "" && val !== undefined) el.value = String(val);
+        if (el) el.value = (val === "" || val === undefined || val === null) ? "" : String(val);
       };
-      setIfEmpty(".sp-sel-min", d.priceMin);
-      setIfEmpty(".sp-sel-maxp", d.priceMax);
-      setIfEmpty(".sp-sel-sold", d.soldMin);
-      setIfEmpty(".sp-sel-maxsold", d.soldMax || "");
-      setIfEmpty(".sp-sel-minpage", d.pageMin);
-      setIfEmpty(".sp-sel-pages", d.pageMax);
+      setVal(".sp-sel-min", d.priceMin);
+      setVal(".sp-sel-maxp", d.priceMax);
+      setVal(".sp-sel-sold", d.soldMin);
+      setVal(".sp-sel-maxsold", d.soldMax ? d.soldMax : "");   // 0＝不設上限 → 留空
+      setVal(".sp-sel-minpage", d.pageMin);
+      setVal(".sp-sel-pages", d.pageMax);
+      setVal(".sp-sel-stores", Number(d.storeMax) > 0 ? d.storeMax : "");  // 0＝不限 → 留空
     };
-    { // 店鋪上限：0/空＝不限制（以模塊值為準，忽略 localStorage 舊值）
-      const storesEl = panel.querySelector(".sp-sel-stores");
-      if (storesEl) storesEl.value = Number(Limits.get("storeMax")) > 0 ? String(Limits.get("storeMax")) : "";
-    }
     fillLimits();
-    Limits.load().then(() => {
-      const storesEl = panel.querySelector(".sp-sel-stores");
-      if (storesEl) storesEl.value = Number(Limits.get("storeMax")) > 0 ? String(Limits.get("storeMax")) : "";
-      fillLimits();
-    });
+    Limits.load().then(() => fillLimits());
     const locEl = panel.querySelector(".sp-sel-loc");
     if (locEl) locEl.value = selGet("loc", "tw") === "overseas" ? "overseas" : "tw";
     autoCheck.checked = Boolean(settings.autoCheck);
@@ -2074,15 +2028,16 @@
       await selectModeNextCard(sel, log);
       return;
     }
-    // 賣場連結：交給 ShopUrl 模塊解析（空 / # / 首頁時自動按 shopid 兜底，不直接跳過）
-    const shopRes = ShopUrl.resolve(shopAnchor);
-    if (!shopRes.url) {
-      selLog(log, `⚠️ 查看賣場連結無效（${shopRes.reason}）且取不到 shopid，跳下一個商品`);
+    const shopHref = shopAnchor.getAttribute("href");
+    const abs = shopHref.startsWith("http") ? shopHref : `https://shopee.tw${shopHref}`;
+    const shopUrl = abs.split("?")[0];
+    // ★ v4.2.18：校驗店鋪連結——空 / # / 首頁，視為「查看賣場」失效，跳過換下一個商品
+    // （Shopee 部分商品頁「查看賣場」href 變空/#，若照跳會到首頁、把站名當店鋪採，導致 0 商品）
+    if (!shopUrl || shopUrl.indexOf("#") !== -1 || /^https?:\/\/shopee\.tw\/?$/.test(shopUrl)) {
+      selLog(log, `⚠️ 查看賣場連結無效（${shopUrl || "空"}），跳下一個商品`);
       await selectModeNextCard(sel, log);
       return;
     }
-    const shopUrl = shopRes.url;
-    if (shopRes.reason === "shopid") selLog(log, `🔧 賣場連結為空，改按 shopid 兜底：shop/${shopRes.shopid}`);
     // 失敗店鋪記憶：剛打不開的店不再反覆進（防止 product↔shop 原地打轉死循環）
     if ((sel.failedShops || []).indexOf(shopUrl) !== -1) {
       selLog(log, "⏭ 該賣場剛才打開失敗，跳過");
