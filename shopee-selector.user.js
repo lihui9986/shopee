@@ -2491,17 +2491,18 @@
       const v = el ? Number(el.value) : NaN;
       return (Number.isFinite(v) && v > 0) ? v : Number(fallback || 0);
     };
-    const min = Math.max(0, inputNum(".sp-sel-min", selGet("min", Limits.get("priceMin"))));
-    const maxPrice = Math.max(0, inputNum(".sp-sel-maxp", selGet("maxPrice", Limits.get("priceMax"))));
-    const minSold = Math.max(0, inputNum(".sp-sel-sold", selGet("minSold", Limits.get("soldMin"))));
-    const maxSold = Math.max(0, inputNum(".sp-sel-maxsold", selGet("maxSold", Limits.get("soldMax"))));
+    // v4.2.35：價格/銷量一律「面板手填 > 服務端模塊」，不再讀本機記憶
+    // （以前 selGet 優先，面板留空會沿用上次舊值，服務端改成 200~1000 也照舊跑 200~500／月銷上限 10000）
+    const min = Math.max(0, inputNum(".sp-sel-min", Limits.get("priceMin")));
+    const maxPrice = Math.max(0, inputNum(".sp-sel-maxp", Limits.get("priceMax")));
+    const minSold = Math.max(0, inputNum(".sp-sel-sold", Limits.get("soldMin")));
+    const maxSold = Math.max(0, inputNum(".sp-sel-maxsold", Limits.get("soldMax")));
     // 店鋪上限：模塊值 0 = 不限制（內部用 9999 表示）
     const storeCap = Number(Limits.get("storeMax")) > 0 ? Number(Limits.get("storeMax")) : 9999;
     const maxStores = Math.max(1, Math.min(storeCap, inputNum(".sp-sel-stores", storeCap)));
     const minPage = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-minpage", selGet("minPage", Limits.get("pageMin")))));
     // 頁數上限：面板手填 > 服務端模塊（Limits.pageMax）> 本機記憶
     // （v4.2.29：以前本機記憶優先，面板留空會沿用上次的舊值 1，模塊改成多少都不生效）
-    // 頁數上限：面板手填 > 服務端模塊（Limits.pageMax）> 本機記憶
     const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", Limits.get("pageMax") || selGet("maxPages", 50))));
     const loc = mode === "os" ? "overseas" : "tw";
     if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
