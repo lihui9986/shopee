@@ -2372,6 +2372,7 @@
     const minPage = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-minpage", selGet("minPage", Limits.get("pageMin")))));
     // 頁數上限：面板手填 > 服務端模塊（Limits.pageMax）> 本機記憶
     // （v4.2.29：以前本機記憶優先，面板留空會沿用上次的舊值 1，模塊改成多少都不生效）
+    // 頁數上限：面板手填 > 服務端模塊（Limits.pageMax）> 本機記憶
     const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", Limits.get("pageMax") || selGet("maxPages", 50))));
     const loc = mode === "os" ? "overseas" : "tw";
     if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
