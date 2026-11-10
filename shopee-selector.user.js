@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.21（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.22（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.21
+// @version      4.2.22
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -167,6 +167,39 @@
   };
 
   function workerId() { return Worker.id(); }
+
+  // ===== MODULE: Limits 選品核心參數（對接服務端 xuanpin_limits 模塊） =====
+  // 職責：價格區間、月銷上下限、總銷下限、頁數上下限、店鋪上限全部由服務端模塊給，腳本只讀不寫死。
+  // 以後改採多少錢、多少銷量、幾頁：只改 xuanpin_limits.py（或環境變量），腳本和後台自動跟著變。
+  const Limits = {
+    data: null,
+    _loadedAt: 0,
+    defaults: { priceMin: 200, priceMax: 500, soldMin: 1, soldMax: 0, histSoldMin: 1, pageMin: 5, pageMax: 30, pageHardMax: 200, storeMax: 50 },
+    async load(log) {
+      if (this.data && Date.now() - this._loadedAt < 60000) return this.data;
+      try {
+        const r = await serverCall("/api/crawler/limits");
+        this.data = Object.assign({}, this.defaults, {
+          priceMin: Number(r.priceMin), priceMax: Number(r.priceMax),
+          soldMin: Number(r.soldMin), soldMax: Number(r.soldMax),
+          histSoldMin: Number(r.histSoldMin),
+          pageMin: Number(r.pageMin), pageMax: Number(r.pageMax),
+          pageHardMax: Number(r.pageHardMax), storeMax: Number(r.storeMax),
+        });
+        this._loadedAt = Date.now();
+        if (log) log(`⚙️ 參數模塊已載入：價格 ${this.data.priceMin}~${this.data.priceMax}｜月銷 ≥${this.data.soldMin}${this.data.soldMax ? " ≤" + this.data.soldMax : ""}｜總銷 ≥${this.data.histSoldMin}｜頁數 ${this.data.pageMin}~${this.data.pageMax}｜店鋪 ≤${this.data.storeMax}`);
+      } catch (e) {
+        if (log) log(`⚠️ 參數模塊讀取失敗（${e.message}），暫用上次/默認值`);
+        this.data = this.data || Object.assign({}, this.defaults);
+      }
+      return this.data;
+    },
+    get(key) {
+      const d = this.data || this.defaults;
+      const v = Number(d[key]);
+      return Number.isFinite(v) ? v : Number(this.defaults[key]);
+    },
+  };
 
   // 內存保護：捕獲包只保留最近 cap 個（正常流程遠低於上限，僅防長時間不刷新頁面的失控堆積）
   function pushCapped(arr, value, cap) {
@@ -869,7 +902,7 @@
       '<button class="sp-sel-resume" style="width:33%;background:#2f855a;color:#fff;border:0;border-radius:4px;padding:5px;cursor:pointer">▶ 繼續</button>' +
       '<button class="sp-sel-stop" style="width:33%;background:#718096;color:#fff;border:0;border-radius:4px;padding:5px;cursor:pointer">⏹ 停止</button>' +
       '</div>' +
-      '<p style="margin:4px 0 0;font-size:11px;color:#888">條件固定：台灣發貨+月銷熱賣+>7天到+非品牌+非商城/優選+無Shopdora水印；從最後一頁向前跑。品牌商品會記入記憶，下次選品直接跳過。</p>' +
+      '<p style="margin:4px 0 0;font-size:11px;color:#888">條件固定：台灣發貨+月銷熱賣+>7天到+非品牌+非商城/優選+無Shopdora水印；從最後一頁向前跑。價格/銷量/頁數/店鋪上限的默認值來自服務端 xuanpin_limits 模塊（面板留空＝用模塊值；填了＝本次臨時覆蓋）。</p>' +
       '</div>' +
       '<div class="sp-bye" style="margin-top:4px;color:#999;cursor:pointer;text-align:right">收起面板</div>';
     document.body.appendChild(panel);
@@ -897,13 +930,34 @@
     prefill(".sp-sel-maxp", "maxPrice", "");
     prefill(".sp-sel-sold", "minSold", "");
     prefill(".sp-sel-maxsold", "maxSold", "");
-    // 店铺上限强制50，忽略localStorage旧值
-    {
+    prefill(".sp-sel-minpage", "minPage", "", true);
+    prefill(".sp-sel-pages", "maxPages", "", true);
+    // 參數模塊（xuanpin_limits）：價格/銷量/頁數/店鋪上限的默認值全部來自服務端模塊，
+    // 面板留空＝自動帶入模塊值；填了就按填的採（臨時覆蓋，不改模塊）
+    const fillLimits = () => {
+      const d = Limits.data || Limits.defaults;
+      const setIfEmpty = (cls, val) => {
+        const el = panel.querySelector(cls);
+        if (el && !String(el.value || "").trim() && val !== "" && val !== undefined) el.value = String(val);
+      };
+      setIfEmpty(".sp-sel-min", d.priceMin);
+      setIfEmpty(".sp-sel-maxp", d.priceMax);
+      setIfEmpty(".sp-sel-sold", d.soldMin);
+      setIfEmpty(".sp-sel-maxsold", d.soldMax || "");
+      setIfEmpty(".sp-sel-stores", d.storeMax);
+      setIfEmpty(".sp-sel-minpage", d.pageMin);
+      setIfEmpty(".sp-sel-pages", d.pageMax);
+    };
+    { // 店鋪上限：以模塊值為準，忽略 localStorage 舊值
       const storesEl = panel.querySelector(".sp-sel-stores");
-      if (storesEl) storesEl.value = "50";
+      if (storesEl) storesEl.value = String(Limits.get("storeMax"));
     }
-    prefill(".sp-sel-minpage", "minPage", 5, true);
-    prefill(".sp-sel-pages", "maxPages", 30, true);
+    fillLimits();
+    Limits.load().then(() => {
+      const storesEl = panel.querySelector(".sp-sel-stores");
+      if (storesEl) storesEl.value = String(Limits.get("storeMax"));
+      fillLimits();
+    });
     const locEl = panel.querySelector(".sp-sel-loc");
     if (locEl) locEl.value = selGet("loc", "tw") === "overseas" ? "overseas" : "tw";
     autoCheck.checked = Boolean(settings.autoCheck);
@@ -2180,6 +2234,8 @@
     };
     let kwRaw = ((document.querySelector(".sp-sel-kw") || {}).value || selGet("kw", ""));
     if (/^https?:\/\//.test(kwRaw.trim())) kwRaw = "";
+    // 參數模塊：價格/銷量/頁數/店鋪上限先從服務端 xuanpin_limits 模塊取一次（60 秒內快取）
+    await Limits.load(log);
     // 面板留空 → 向服務端領一個專屬關鍵詞（多標籤各領不同詞，見 xuanpin_workers）
     if (!kwRaw.trim()) {
       const claimed = await Worker.claim(log, "");
@@ -2197,13 +2253,19 @@
     Worker._count = 0;
     Worker.startHeartbeat(60000);
     selLog(log, `📋 共 ${kwList.length} 個關鍵詞：${kwList.join("、")}（Worker ${Worker.id()}）`);
-    const min = Math.max(0, Number(((document.querySelector(".sp-sel-min") || {}).value) || selGet("min", 200)));
-    const maxStores = Math.max(1, Math.min(50, Number(((document.querySelector(".sp-sel-stores") || {}).value) || 50)));
-    const minPage = Math.max(1, Math.min(200, Number(((document.querySelector(".sp-sel-minpage") || {}).value) || selGet("minPage", 5))));
-    const maxPages = Math.max(1, Math.min(200, Number(((document.querySelector(".sp-sel-pages") || {}).value) || selGet("maxPages", 30))));
-    const minSold = Math.max(0, Number(((document.querySelector(".sp-sel-sold") || {}).value) || selGet("minSold", 0)));
-    const maxPrice = Math.max(0, Number(((document.querySelector(".sp-sel-maxp") || {}).value) || selGet("maxPrice", 500)));
-    const maxSold = Math.max(0, Number(((document.querySelector(".sp-sel-maxsold") || {}).value) || selGet("maxSold", 0)));
+    // 面板填了就用面板值；留空（或 0）＝用參數模塊 xuanpin_limits / 上次記憶
+    const inputNum = (cls, fallback) => {
+      const el = document.querySelector(cls);
+      const v = el ? Number(el.value) : NaN;
+      return (Number.isFinite(v) && v > 0) ? v : Number(fallback || 0);
+    };
+    const min = Math.max(0, inputNum(".sp-sel-min", selGet("min", Limits.get("priceMin"))));
+    const maxPrice = Math.max(0, inputNum(".sp-sel-maxp", selGet("maxPrice", Limits.get("priceMax"))));
+    const minSold = Math.max(0, inputNum(".sp-sel-sold", selGet("minSold", Limits.get("soldMin"))));
+    const maxSold = Math.max(0, inputNum(".sp-sel-maxsold", selGet("maxSold", Limits.get("soldMax"))));
+    const maxStores = Math.max(1, Math.min(Limits.get("storeMax"), inputNum(".sp-sel-stores", Limits.get("storeMax"))));
+    const minPage = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-minpage", selGet("minPage", Limits.get("pageMin")))));
+    const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", selGet("maxPages", Limits.get("pageMax")))));
     const loc = mode === "os" ? "overseas" : "tw";
     if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
     tabStore.setItem("sp_sel_kw", kw.trim());
