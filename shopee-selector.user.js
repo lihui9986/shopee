@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.40（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.41（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.40
+// @version      4.2.41
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -35,6 +35,30 @@
   "use strict";
   if (window.__spCrawlerV15) return;
   window.__spCrawlerV15 = true;
+
+  // v4.2.41：啟動失敗不再靜默——把錯誤直接畫到頁面上並上報服務端，避免「面板不出來又查不到原因」。
+  function showFatal(err) {
+    const msg = err && (err.stack || err.message) ? (err.stack || err.message) : String(err);
+    try { console.error("[ShopeeSelector] 啟動失敗:", msg); } catch (_) {}
+    try {
+      const d = document.createElement("div");
+      d.style.cssText = "position:fixed;z-index:2147483000;left:12px;top:12px;max-width:60vw;max-height:46vh;overflow:auto;background:#fff;color:#c00;border:2px solid #c00;border-radius:8px;padding:10px 12px;font:12px/1.5 monospace;box-shadow:0 8px 28px rgba(0,0,0,.35)";
+      d.textContent = "選品腳本啟動失敗（請把這段截圖發給助手）\n" + msg;
+      (document.body || document.documentElement).appendChild(d);
+    } catch (_) {}
+    try {
+      if (typeof GM_xmlhttpRequest === "function") {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url: "http://192.168.139.130:4180/api/profit/select-debug/debug",
+          headers: { "Content-Type": "application/json" },
+          data: JSON.stringify(["💥 啟動失敗: " + String(msg).slice(0, 500)]),
+        });
+      }
+    } catch (_) {}
+  }
+
+  try {
 
   const SETTINGS_KEY = "sp_crawler_settings_v14";
   const QUEUE_KEY = "sp_crawler_queue_v14";
@@ -496,6 +520,36 @@
   function parseNumber(text) {
     const m = String(text || "").replace(/,/g, "").match(/(\d+(\.\d+)?)/);
     return m ? Number(m[1]) : null;
+  }
+
+  // v4.2.41：銷量數字解析——支援「1.2萬」「12K」「1,000+」「3.5千」等寫法。
+  // 舊版只抓整數，Shopee 卡片顯示「已售出 1.2萬」時會被解析成 1，服務端 min_sales=5 直接判「無銷量」丟掉，
+  // 表現就是「掃了一堆卡片、全被拒、沒數據」。
+  function parseCount(text) {
+    const s = String(text || "").replace(/,/g, "").trim();
+    const m = s.match(/(\d+(?:\.\d+)?)\s*(萬|万|千|K|k)?/);
+    if (!m) return null;
+    let n = Number(m[1]);
+    const unit = m[2] || "";
+    if (!Number.isFinite(n)) return null;
+    if (unit === "萬" || unit === "万") n *= 10000;
+    else if (unit === "千") n *= 1000;
+    else if (unit === "K" || unit === "k") n *= 1000;
+    return Math.round(n);
+  }
+
+  // 從卡片文字抽銷量：優先「月銷 N」，其次「已售出 N」「已售 N」「N 人已買/付款」
+  function parseSoldFromText(text) {
+    const t = String(text || "");
+    const month = t.match(/月銷[量]?\s*([\d,.]+\s*[萬万千Kk]?)/);
+    if (month) return parseCount(month[1]);
+    const sold = t.match(/已售出\s*([\d,.]+\s*[萬万千Kk]?)/);
+    if (sold) return parseCount(sold[1]);
+    const sold2 = t.match(/已售\s*([\d,.]+\s*[萬万千Kk]?)/);
+    if (sold2) return parseCount(sold2[1]);
+    const buyers = t.match(/([\d,.]+\s*[萬万千Kk]?)\s*人(?:已買|付款|購買|下單)/);
+    if (buyers) return parseCount(buyers[1]);
+    return null;
   }
 
   // ===== MODULE 3: Parse 解析（卡片/標題/合併） =====
@@ -1589,20 +1643,9 @@
     return samples;
   }
 
-  // 在分頁器附近找「下一頁」按鈕（> 箭頭）
-  function findPagerNext(pagerEl) {
-    let box = pagerEl.parentElement;
-    for (let i = 0; i < 4 && box; i += 1) {
-      const btns = [...box.querySelectorAll("button, a")].filter((b) => {
-        const t = (b.innerText || "").trim();
-        const label = (b.getAttribute("aria-label") || "") + b.className;
-        return t === ">" || /next/i.test(label) || /arrow.*right|right.*arrow/i.test(label);
-      });
-      if (btns.length) return btns[btns.length - 1];
-      box = box.parentElement;
-    }
-    return null;
-  }
+  // v4.2.41：此處原有一份同名舊版 findPagerNext（只認 ">" 文字），
+  // 與上面基於「1/9 分頁器向右比較水平位置」的版本重名，舊版在函數作用域裡覆蓋了新版，
+  // 導致改進的分頁器查找實際從未生效。已刪除舊版，只保留上面那份。
 
   // 店鋪頁頭資料卡內的商城/優選徽標：從「聊聊」按鈕向上找含 關注+聊聊 的頁頭卡片，只查該卡片文字（避免頁腳誤判）
   function shopHeaderMallHit() {
@@ -2739,5 +2782,9 @@
   installHooks();
   if (document.body) buildPanel();
   else window.addEventListener("DOMContentLoaded", buildPanel);
+
+  } catch (err) {
+    showFatal(err);
+  }
 })();
 
