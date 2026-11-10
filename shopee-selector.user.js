@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.24（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.25（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.24
+// @version      4.2.25
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -151,6 +151,12 @@
       this._timer = setInterval(() => {
         this._post("/api/crawler/workers/heartbeat", { workerId: this.id(), productCount: this._count })
           .catch(() => { /* 心跳失敗不影響採集 */ });
+        // 店鋪租約同一個節奏續期：大店採超過 30 分鐘也不會被別的標籤搶走
+        serverCall("/api/crawler/shops/heartbeat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workerId: this.id() }),
+        }).catch(() => { /* 同上 */ });
       }, intervalMs || 60000);
     },
     stopHeartbeat() {
@@ -160,6 +166,9 @@
     async release(log) {
       this.stopHeartbeat();
       try {
+        await ShopLease.release();   // 順手把手上未採完的店鋪還回去
+      } catch (_) { /* ShopLease 未就緒時忽略 */ }
+      try {
         const r = await this._post("/api/crawler/workers/release", { workerId: this.id() });
         if (log && r && r.keyword) log(`🔓 已釋放關鍵詞「${r.keyword}」，其他標籤可接`);
       } catch (_) { /* 釋放失敗等租約到期自動回收 */ }
@@ -167,6 +176,54 @@
   };
 
   function workerId() { return Worker.id(); }
+
+  // ===== MODULE: ShopLease 店鋪派工（對接服務端 xuanpin_shop_lease 模塊） =====
+  // 職責：進店前先向服務端申請這家店，別人正在採/剛採完就不採——多標籤不再搶同一批店。
+  // 服務端不可達時放行（寧可重複一次，也不讓任務空轉）。
+  const ShopLease = {
+    _cur: null,
+    async claim(log, shopid, username) {
+      try {
+        const r = await serverCall("/api/crawler/shops/claim", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workerId: Worker.id(), shopid: shopid || null, username: username || "", keyword: Worker.keyword || "" }),
+        });
+        this._cur = { shopid, username };
+        if (r && r.claimed === false) {
+          const why = r.reason === "other_running" ? `標籤 ${r.owner || "?"} 正在採（還剩 ${r.waitSeconds || "?"} 秒）`
+                   : r.reason === "recently_done" ? `剛由標籤 ${r.owner || "?"} 採完（${r.doneSecondsAgo || 0} 秒前）`
+                   : r.reason;
+          if (log) log(`⏭ 該店鋪不給本標籤採：${why}，換下一個商品`);
+          return false;
+        }
+        if (log) log(`🔑 店鋪已派給本標籤${r && r.reason === "mine" ? "（續採上次未完成的）" : ""}`);
+        return true;
+      } catch (e) {
+        if (log) log(`⚠️ 店鋪派工失敗（${e.message}），本次照採，可能與其他標籤重複`);
+        return true;
+      }
+    },
+    async release() {
+      try {
+        await serverCall("/api/crawler/shops/release", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workerId: Worker.id() }),
+        });
+      } catch (_) { /* 释放失败等租约 30 分钟自动过期 */ }
+    },
+    async finish(shopid, username, productCount) {
+      try {
+        const r = await serverCall("/api/crawler/shops/finish", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workerId: Worker.id(), shopid: shopid || null, username: username || "", productCount: productCount || 0 }),
+        });
+        return r && r.stats ? r.stats : null;
+      } catch (_) { return null; }
+    },
+  };
 
   // ===== MODULE: Limits 選品核心參數（對接服務端 xuanpin_limits 模塊） =====
   // 職責：價格區間、月銷上下限、總銷下限、頁數上下限、店鋪上限全部由服務端模塊給，腳本只讀不寫死。
@@ -2026,6 +2083,11 @@
       await selectModeNextCard(sel, log);
       return;
     }
+    // 店鋪派工：一家店同時只給一個標籤採（服務端 xuanpin_shop_lease），避免多標籤重複勞動、日誌互蓋
+    if (!(await ShopLease.claim(log, shopIdHere, ""))) {
+      await selectModeNextCard(sel, log);
+      return;
+    }
     // 店內流程：先點「所有商品」分頁，再切「月銷熱賣」排序（和人工操作一致）
     let allTab = null;
     for (const el of document.querySelectorAll("a, div, button, span")) {
@@ -2166,6 +2228,7 @@
       if (!pushedIds.size) {
         if (items.length === 0 && !retryQueue.length) selLog(log, "⚠️ 該賣場沒有符合選品條件的商品");
         else selLog(log, "❌ 本店各輪推送均失敗（服務器不可達？），換下一個商品繼續");
+        await ShopLease.finish(shopIdHere, username, pushedIds.size);   // 標記已採過，別的標籤不再進
         await selectModeNextCard(sel, log);
         return;
       }
@@ -2180,14 +2243,15 @@
       rememberShopCollected(firstShopId, username);
       if (window.__spCollectedShops) window.__spCollectedShops.push(firstShopId);
       saveSelectState(sel);
-      setStatus(`選品：已完成 ${sel.storesDone}/${sel.maxStores} 家店`);
-      selLog(log, `✅ 本店完成：增量入庫共 ${pushedIds.size} 個商品（分 ${incPushes} 次推送）`);
-      await selectModeNextCard(sel, log);
+      const gstat = await ShopLease.finish(shopIdHere, username, pushedIds.size);
+      setStatus(`選品：本標籤已完成 ${sel.storesDone}/${sel.maxStores} 家${gstat ? `（全局今日 ${gstat.doneToday} 家）` : ""}`);
+      selLog(log, `✅ 本店完成：增量入庫共 ${pushedIds.size} 個商品（分 ${incPushes} 次推送）`);      await selectModeNextCard(sel, log);
       return;
     }
     // ===== 以下為台灣模式原路徑（整店掃完一次性推送）=====
     if (!items.length) {
       selLog(log, "⚠️ 該賣場沒有符合選品條件的商品");
+      await ShopLease.finish(shopIdHere, username, 0);   // 標記已採過，別的標籤不再進
       await selectModeNextCard(sel, log);
       return;
     }
@@ -2205,7 +2269,8 @@
       rememberShopCollected(firstShopId, username);
       if (window.__spCollectedShops) window.__spCollectedShops.push(firstShopId);
       saveSelectState(sel);
-      setStatus(`選品：已完成 ${sel.storesDone}/${sel.maxStores} 家店`);
+      const gstat2 = await ShopLease.finish(shopIdHere, username, items.length);
+      setStatus(`選品：本標籤已完成 ${sel.storesDone}/${sel.maxStores} 家${gstat2 ? `（全局今日 ${gstat2.doneToday} 家）` : ""}`);
     }
     await selectModeNextCard(sel, log);
   }
