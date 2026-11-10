@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.37（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.38（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.37
+// @version      4.2.38
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -1626,11 +1626,17 @@
   // 店鋪採集記憶：30 天內採集過的店不再重複採集
   const SHOP_MEMORY_KEY = "sp_sel_shop_memory";
   const SHOP_MEMORY_DAYS = 30;
+  let shopMemoryCache = null;
   function loadShopMemory() {
-    try { return JSON.parse(localStorage.getItem(SHOP_MEMORY_KEY)) || []; } catch (_) { return []; }
+    if (shopMemoryCache) return shopMemoryCache;
+    try { shopMemoryCache = JSON.parse(localStorage.getItem(SHOP_MEMORY_KEY)) || []; } catch (_) { shopMemoryCache = []; }
+    return shopMemoryCache;
   }
   function saveShopMemory(list) {
-    localStorage.setItem(SHOP_MEMORY_KEY, JSON.stringify(list.slice(-300)));
+    const cutoff = Date.now() - SHOP_MEMORY_DAYS * 24 * 60 * 60 * 1000;
+    const trimmed = list.filter((e) => e && Number(e.at) >= cutoff).slice(-300);
+    shopMemoryCache = trimmed;
+    localStorage.setItem(SHOP_MEMORY_KEY, JSON.stringify(trimmed));
   }
   function wasShopCollectedRecently(shopid) {
     return recentShopCollector(shopid) !== "";
@@ -1666,12 +1672,24 @@
   let brandServerQueue = [];
   let brandServerTimer = null;
 
+  // v4.2.38：本機品牌記憶加內存快取——之前每個商品都 JSON.parse 一次 localStorage（2000 條×上千商品），
+  // 是進店採集卡頓的主因之一。寫入時同步刷新快取，讀取只回傳同一個數組。
+  let brandMemoryCache = null;
   function loadBrandMemoryLocal() {
+    if (brandMemoryCache) return brandMemoryCache;
     try {
       const cutoff = Date.now() - BRAND_MEMORY_DAYS * DAY_MS;
-      return (JSON.parse(localStorage.getItem(BRAND_MEMORY_KEY)) || [])
+      brandMemoryCache = (JSON.parse(localStorage.getItem(BRAND_MEMORY_KEY)) || [])
         .filter((e) => e && Number.isFinite(Number(e.i)) && Number(e.i) > 0 && Number(e.at) >= cutoff);
-    } catch (_) { return []; }
+    } catch (_) { brandMemoryCache = []; }
+    return brandMemoryCache;
+  }
+  function saveBrandMemoryLocal(list) {
+    const cutoff = Date.now() - BRAND_MEMORY_DAYS * DAY_MS;
+    const trimmed = list.filter((e) => e && Number(e.at) >= cutoff);
+    while (trimmed.length > 2000) trimmed.shift();
+    brandMemoryCache = trimmed;
+    try { localStorage.setItem(BRAND_MEMORY_KEY, JSON.stringify(trimmed)); } catch (_) { /* 存滿不影響流程 */ }
   }
 
   function ensureBrandMemoryLoaded() {
@@ -1707,8 +1725,7 @@
     brandMemoryIds.add(id);
     const list = loadBrandMemoryLocal().filter((e) => Number(e.i) !== id);
     list.push({ i: id, s: Number(shopid) || null, b: String(brandName || "").slice(0, 80), at: Date.now() });
-    while (list.length > 2000) list.shift();
-    try { localStorage.setItem(BRAND_MEMORY_KEY, JSON.stringify(list)); } catch (_) { /* 存滿不影響流程 */ }
+    saveBrandMemoryLocal(list);
     queueBrandSync({ itemid: id, shopid: Number(shopid) || null, brand: String(brandName || "").slice(0, 80) });
   }
 
@@ -1748,7 +1765,7 @@
       }
     }
     while (local.length > 2000) local.shift();
-    try { localStorage.setItem(BRAND_MEMORY_KEY, JSON.stringify(local)); } catch (_) { /* 存滿不影響流程 */ }
+    saveBrandMemoryLocal(local);
     return applied;
   }
 
