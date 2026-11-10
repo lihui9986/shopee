@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.41（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.42（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.41
+// @version      4.2.42
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -602,8 +602,14 @@
       url: `https://shopee.tw${href.split("?")[0]}`,
       price: price !== null ? Math.round(price * 100000) : null,
       price_before_discount: null,
-      sold: parseNumber((text.match(/月銷[量]?\s*([\d,]+)/) || [])[1]),
-      historical_sold: parseNumber((text.match(/已售出\s*([\d,]+)/) || [])[1]),
+      sold: (() => {
+        const m = text.match(/月銷[量]?\s*([\d,.]+\s*[萬万千Kk]?)/);
+        return m ? parseCount(m[1]) : null;
+      })(),
+      historical_sold: (() => {
+        const m = text.match(/已售(?:出)?\s*([\d,.]+\s*[萬万千Kk]?)/);
+        return m ? parseCount(m[1]) : null;
+      })(),
       stock: null,
       liked_count: likesMatch ? Number(likesMatch[1]) : null,
       rating_star: rating,
@@ -954,10 +960,44 @@
     return now - last >= shop.intervalDays * DAY_MS;
   }
 
+  // ===== v4.2.42：店鋪 URL 路由兼容 =====
+  // 後台名單（monitor-list）裡歷史遺留的 username 可能是 `shop_<shopid>` 佔位符，
+  // 直接拼 https://shopee.tw/shop_7839124 是蝦皮不存在的路由，打開只有頁腳、DOM 0 商品，
+  // 表現就是「每店已讀取 0 個商品 → 全店跳過 → ingest 一次都不調」。正確路由是 /shop/<shopid>。
+  function shopUrlPath(username, shopid) {
+    const u = String(username || "").trim();
+    const sid = Number(shopid);
+    if (/^shop_\d+$/i.test(u)) return "/shop/" + u.slice(5);
+    if (/^\d+$/.test(u)) return "/shop/" + u;
+    if (u) return "/" + u.replace(/^\/+/, "");
+    return Number.isFinite(sid) && sid > 0 ? "/shop/" + sid : "";
+  }
+
+  function buildShopUrl(username, shopid) {
+    const path = shopUrlPath(username, shopid);
+    return path ? "https://shopee.tw" + path : "";
+  }
+
+  // 當前頁面所屬店鋪的真實用户名：/shop/<shopid> 這類數字路由要從 API 捕獲或頁面標題兜底取，
+  // 取不到再退化成 shop_<shopid>（至少推送時能帶上 shopid，不會把「shop」當店名推到後台）。
+  function currentShopUsername() {
+    const seg = (location.pathname || "").split("/").filter(Boolean);
+    const first = seg[0] || "";
+    if (first && first !== "shop" && first !== "search" && first !== "verify" && !first.startsWith("verify")) {
+      return decodeURIComponent(first).trim();
+    }
+    const info = pickShopInfoDom();
+    let name = String((info && (info.username || info.name)) || "").trim();
+    name = name.replace(/[，,]\s*(線上商店|官方旗艦店|商城|賣場|商店).*$/g, "").trim();
+    if (name) return name;
+    const m = (location.pathname || "").match(/\/shop\/(\d+)/);
+    return m ? "shop_" + m[1] : "";
+  }
+
   // 抓當前店鋪前先從工作台拉最新條件：店鋪單獨條件優先，不在名單則用全局條件（實時同步）
   async function captureHereWithFreshFilters(log) {
     await Limits.load(log);   // 價格/銷量/頁數門檻先取參數模塊
-    const username = (location.pathname.split("/")[1] || "").trim();
+    const username = currentShopUsername();
     if (!username || location.pathname.includes("/verify/")) {
       log("⚠️ 請先打開一家店鋪的頁面");
       return null;
@@ -983,7 +1023,7 @@
   }
 
   async function captureCurrentShop(shopEntry, log) {
-    const username = (location.pathname.split("/")[1] || "").trim();
+    const username = currentShopUsername();
     if (!username || location.pathname.includes("/verify/")) {
       log("⚠️ 請先打開一家店鋪的頁面");
       return null;
@@ -1073,13 +1113,13 @@
     if (!listResult) return;
     const all = listResult.shops || [];
     if (!all.length) { log("⚠️ 工作台名單為空，請先在「竞店爬虫」欄目保存名單"); return; }
-    const queue = all.map((shop) => ({ username: shop.username, filters: shop.filters }));
+    const queue = all.map((shop) => ({ username: shop.username, shopid: shop.shopid, filters: shop.filters }));
     tabStore.setItem(QUEUE_KEY, JSON.stringify(queue));
     tabStore.setItem(AUTO_KEY, "1");
     setStatus(`同步抓取：0/${queue.length}`);
     log(`🤖 開始抓取全部 ${queue.length} 家監控店鋪，正在跳轉到第一家…`);
     state.running = true;
-    location.href = "https://shopee.tw/" + queue[0].username;
+    location.href = buildShopUrl(queue[0].username, queue[0].shopid);
   }
 
   // 抓取到期店鋪：只抓超過週期沒抓的
@@ -1094,13 +1134,13 @@
     const skipped = all.length - due.length;
     if (skipped) log(`⏭ ${skipped} 家店鋪未到抓取週期，已跳過`);
     if (!due.length) { log("✅ 所有店鋪都未到抓取週期，無需抓取"); return; }
-    const queue = due.map((shop) => ({ username: shop.username, filters: shop.filters }));
+    const queue = due.map((shop) => ({ username: shop.username, shopid: shop.shopid, filters: shop.filters }));
     tabStore.setItem(QUEUE_KEY, JSON.stringify(queue));
     tabStore.setItem(AUTO_KEY, "1");
     setStatus(`補抓到期：0/${queue.length}`);
     log(`🤖 補抓 ${queue.length} 家到期店鋪，正在跳轉到第一家…`);
     state.running = true;
-    location.href = "https://shopee.tw/" + queue[0].username;
+    location.href = buildShopUrl(queue[0].username, queue[0].shopid);
   }
 
   async function continueAutoMode(log) {
@@ -1124,7 +1164,7 @@
       setStatus(`自動模式：已處理，剩餘 ${rest.length} 家`);
       log(`➡️ 3 秒後前往下一家：${rest[0].username}`);
       await sleep(3000);
-      location.href = "https://shopee.tw/" + rest[0].username;
+      location.href = buildShopUrl(rest[0].username, rest[0].shopid);
     } else {
       setStatus("等待60秒後自動重新拉爆款列表...");
       log("🔄 全部完成，60秒後自動重新拉取最新爆款列表繼續採集...");
