@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.27（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.28（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.27
+// @version      4.2.28
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -123,6 +123,16 @@
       }
       return v;
     },
+    // 每次「開始選品」都換一個新標籤 ID：
+    // sessionStorage 會被 Chrome「複製標籤頁」一起複製，導致多標籤共用同一 ID、後台只看到一個標籤。
+    // 同一任務內跳頁仍沿用這個 ID（存在 sessionStorage），停止/續跑都不受影響。
+    reset() {
+      const v = "w" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
+      tabStore.setItem("sp_worker_id", v);
+      this.keyword = "";
+      this._count = 0;
+      return v;
+    },
     _post(path, body) {
       return serverCall(path, {
         method: "POST",
@@ -231,7 +241,7 @@
   const Limits = {
     data: null,
     _loadedAt: 0,
-    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 50, pageHardMax: 200, storeMax: 0 },
+    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 30, pageHardMax: 200, storeMax: 0 },
     async load(log) {
       if (this.data && Date.now() - this._loadedAt < 60000) return this.data;
       try {
@@ -2282,6 +2292,11 @@
 
   async function startSelectMode(log, mode) {
     if (!window.__spDbgLoop) { window.__spDbgLoop = true; dbgCommandLoop(); }
+    // 每個任務開頭換一個新的標籤 ID：避免「複製標籤頁」把 sessionStorage 裡的舊 ID 一起帶過來，
+    // 導致多個標籤在後台顯示成同一個（後台只看到 1 個標籤、店鋪派工失效）。
+    // 每個任務開頭換一個新的標籤 ID：避免「複製標籤頁」把 sessionStorage 裡的舊 ID 一起帶過來，
+    // 導致多個標籤在後台顯示成同一個（後台只看到 1 個標籤、店鋪派工失效）。
+    Worker.reset();
     // 新選品任務隨後會跳轉搜索頁重新捕獲，先釋放舊任務殘留的捕獲包
     captured.items.length = 0;
     captured.shopBases.length = 0;
@@ -2324,9 +2339,7 @@
     const storeCap = Number(Limits.get("storeMax")) > 0 ? Number(Limits.get("storeMax")) : 9999;
     const maxStores = Math.max(1, Math.min(storeCap, inputNum(".sp-sel-stores", storeCap)));
     const minPage = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-minpage", selGet("minPage", Limits.get("pageMin")))));
-    // 頁數上限：面板手填 > 服務端模塊（Limits.pageMax）> 本機記憶
-    // （v4.2.27 修正：以前本機記憶優先，面板留空時會沿用上次的舊值 1，模塊改成多少都不生效）
-    const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", Limits.get("pageMax") || selGet("maxPages", 50))));
+    const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", selGet("maxPages", Limits.get("pageMax")))));
     const loc = mode === "os" ? "overseas" : "tw";
     if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
     tabStore.setItem("sp_sel_kw", kw.trim());
@@ -2397,7 +2410,7 @@
         return;
       }
       sel.minPage = sel.minPage || 5;
-      sel.maxPages = sel.maxPages || Limits.get("pageMax") || 50;
+      sel.maxPages = sel.maxPages || 30;
       sel.pagesUsed = sel.pagesUsed || 0;
       sel.page = sel.page || 1;
       sel.storesDone = sel.storesDone || 0;
