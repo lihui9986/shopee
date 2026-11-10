@@ -311,8 +311,7 @@
       }
       return "";
     },
-  };
-  // ===== MODULE: Limits 選品核心參數（對接服務端 xuanpin_limits 模塊） =====
+  };  // ===== MODULE: Limits 選品核心參數（對接服務端 xuanpin_limits 模塊） =====
   // 職責：價格區間、月銷上下限、總銷下限、頁數上下限、店鋪上限全部由服務端模塊給，腳本只讀不寫死。
   // 以後改採多少錢、多少銷量、幾頁：只改 xuanpin_limits.py（或環境變量），腳本和後台自動跟著變。
   const Limits = {
