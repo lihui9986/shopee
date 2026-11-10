@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.14（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.15（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.14
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）
+// @version      4.2.15
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -14,7 +14,7 @@
 // ==/UserScript==
 
 /* ============================================================================
- * 模塊索引（v4.2.14 · 單一職責 · 互不干擾）
+ * 模塊索引（v4.2.15 · 單一職責 · 互不干擾）
  * 每個功能一個 MODULE，模塊間只通過明確函數接口交互，不直接改對方內部狀態。
  *   1. Meta/Config       元信息、常量、配置讀寫
  *   2. NetCapture        網絡鉤子、服務器調用、商品/詳情捕獲
@@ -396,12 +396,38 @@
     };
   }
 
+  // DOM 兜底取店名：Shopee 接口偶發改路徑/無捕獲時，從店鋪頁 URL 與標題取店名，
+  // 使進店取店名不再強依賴 API，避免「沒拿到賣場名稱」全店被跳過（零採集根因修復）。
+  function pickShopInfoDom() {
+    const path = location.pathname || "";
+    const m = path.match(/\/shop\/(\d+)(?:\/([^/?#]+))?/);
+    const shopid = m ? Number(m[1]) : 0;
+    const slug = m && m[2] ? decodeURIComponent(m[2]) : "";
+    let name = "";
+    const t = (document.title || "").trim();
+    if (t) {
+      const tm = t.match(/^(.+?)\s*[|｜\-–—]\s*蝦皮/)
+        || t.match(/^(.+?)\s*[|｜]\s*/)
+        || t.match(/^(.+?)\s*的賣場/)
+        || t.match(/^(.+?)\s*的商店/);
+      if (tm) name = tm[1].trim();
+    }
+    if (!name) {
+      const hdr = document.querySelector(".shop-name, [class*='shop-name'], header h1");
+      if (hdr && hdr.textContent) name = hdr.textContent.trim();
+    }
+    const username = slug || name || "";
+    return { shopid, username, name, _domFallback: true };
+  }
+
   function pickShopInfo(username) {
     for (let i = captured.shopBases.length - 1; i >= 0; i -= 1) {
       const data = captured.shopBases[i] && captured.shopBases[i].data;
       if (data && (!username || (data.account && data.account.username === username) || data.username === username)) return data;
     }
-    return captured.shopBases.length ? captured.shopBases[captured.shopBases.length - 1].data : null;
+    if (captured.shopBases.length) return captured.shopBases[captured.shopBases.length - 1].data;
+    // API 無捕獲 → DOM 兜底（Shopee 接口改路徑等場景，避免零採集）
+    return pickShopInfoDom();
   }
 
   async function scrollCollect(seen, log) {
@@ -770,7 +796,7 @@
     panel.style.cssText = "position:fixed;top:80px;right:16px;z-index:999999;width:320px;background:#fff;border:2px solid #ee4d2d;border-radius:8px;padding:10px;font:12px/1.5 sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.2)";
     const settings = loadSettings();
     panel.innerHTML =
-      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v' + (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version ? GM_info.script.version : "4.2.8") + ' · 台灣/海外雙選品</div>' +
+      '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v' + (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version ? GM_info.script.version : "4.2.15") + ' · 台灣/海外雙選品</div>' +
       '<input class="sp-server" autocomplete="off" placeholder="工作台地址，其他電腦填 http://伺服器IP:4180" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<input class="sp-token" autocomplete="off" placeholder="連接令牌（工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-auto-check"> 打開蝦皮時自動補抓到期店鋪</label>' +
@@ -1943,7 +1969,8 @@
       await waitForCards(5, 15000);
     }
     const info = pickShopInfo();
-    const username = info && info.account && info.account.username ? info.account.username : "";
+    const username = info && ((info.account && info.account.username) ? info.account.username : (info.username || ""));
+    if (info && info._domFallback) selLog(log, `🔧 DOM 兜底取店名：${username || "(URL/標題未解析)"}`);
     if (info && info.name && /代購|代购/.test(info.name)) {
       selLog(log, `⏭ 跳過代購店「${info.name}」（基本是品牌無法跟賣）`);
       await selectModeNextCard(sel, log);
