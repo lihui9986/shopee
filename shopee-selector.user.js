@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.33（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.34（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.33
+// @version      4.2.34
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -312,13 +312,70 @@
       return "";
     },
   };
+  // ===== MODULE: SearchCardPush 搜索頁合格卡片直接入庫 =====
+  // 職責：把搜索頁已通過篩選的卡片打包成 ingest 需要的商品物件並推送。
+  // 為什麼需要：進店後會按「搜什麼只採什麼」再卡一次關鍵詞，店鋪是全品類賣場，
+  // 3 字連續片段幾乎必然不匹配 → 整店判空 → 長期 0 入庫。搜索頁的卡片本身
+  // 就是該關鍵詞的搜索結果，價格/月銷/徽標/品牌/違禁類目都已過，直接入庫最真實。
+  const SearchCardPush = {
+    _pushed: new Set(),
+    enabled() {
+      return Limits.get("pushSearchCards") !== 0;
+    },
+    build(parsed, apiItem) {
+      const it = {
+        itemid: Number(parsed.itemid),
+        shopid: Number(parsed.shopid) || (apiItem && Number(apiItem.shopid)) || null,
+        name: parsed.name,
+        price: parsed.price,
+        sold: parsed.sold,
+        historical_sold: (apiItem && Number(apiItem.historical_sold)) || parsed.sold,
+        url: parsed.url,
+      };
+      if (apiItem) {
+        if (apiItem.item_rating) it.item_rating = apiItem.item_rating;
+        if (apiItem.shop_location) it.shop_location = apiItem.shop_location;
+        if (apiItem.shop_name) it.shop_name = apiItem.shop_name;
+        if (apiItem.shop_username) it.shop_username = apiItem.shop_username;
+      }
+      return it;
+    },
+    async flush(cards, log, sourceTag) {
+      const fresh = [];
+      for (const c of cards || []) {
+        const it = this.build(c.parsed, c.apiItem);
+        if (!it.itemid || this._pushed.has(it.itemid)) continue;
+        if (!it.name || it.price === null || it.price === undefined) continue;
+        fresh.push(it);
+      }
+      if (!fresh.length) return 0;
+      const byShop = new Map();
+      for (const it of fresh) {
+        const k = String(it.shopid || "0");
+        if (!byShop.has(k)) {
+          // 卡片沒有店名，但 ingest 必須有 username 才會落庫（upsert_shop 空名即跳過整店）
+          // 取真實店名（apiItem 有就優先用），否則用 shop_<shopid> 佔位，進店採集時仍會補真實店名
+          const username = it.shop_username || (it.shopid ? `shop_${it.shopid}` : "");
+          byShop.set(k, {
+            username,
+            shop_info: { shopid: it.shopid || 0, username, name: it.shop_name || username },
+            items: [],
+          });
+        }
+        byShop.get(k).items.push(it);
+      }
+      const ok = await pushShops([...byShop.values()], log, sourceTag);
+      if (ok) fresh.forEach((it) => this._pushed.add(it.itemid));
+      return ok ? fresh.length : 0;
+    },
+  };
   // ===== MODULE: Limits 選品核心參數（對接服務端 xuanpin_limits 模塊） =====
   // 職責：價格區間、月銷上下限、總銷下限、頁數上下限、店鋪上限全部由服務端模塊給，腳本只讀不寫死。
   // 以後改採多少錢、多少銷量、幾頁：只改 xuanpin_limits.py（或環境變量），腳本和後台自動跟著變。
   const Limits = {
     data: null,
     _loadedAt: 0,
-    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 50, pageHardMax: 200, storeMax: 0, skipPreferredShop: 0 },
+    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 50, pageHardMax: 200, storeMax: 0, skipPreferredShop: 0, pushSearchCards: 1 },
     async load(log) {
       if (this.data && Date.now() - this._loadedAt < 60000) return this.data;
       try {
@@ -1865,6 +1922,7 @@
     const cards = document.querySelectorAll('a[href*="-i."]');
     const seenCard = new Set();
     const pending = [];
+    const qualifiedCards = [];   // v4.2.34：本頁合格卡片的完整資料，交給 SearchCardPush 直接入庫
     for (const a of cards) {
       try {
         const parsed = parseCard(a);
@@ -1886,10 +1944,18 @@
         const reason = cardQualifiesSelect(container, apiItem, sel.minSold || 0, sel.maxSold || 0, sel.mode);
         if (reason) { selLog(log, `   跳過「${(parsed.name || "").slice(0, 14)}…」：${reason}`); continue; }
         pending.push(parsed.url);
+        qualifiedCards.push({ parsed, apiItem });
         if (pending.length >= 40) break;
       } catch (_) {}
     }
     selLog(log, `   本頁符合條件商品：${pending.length} 個`);
+    // ===== v4.2.34：搜索頁合格卡片直接入庫（進店全店按關鍵詞卡死的破解路徑）=====
+    // 這些卡片已過：關鍵詞搜索結果、價格 200~1000、月銷、商城/優選徽標、品牌記憶、違禁類目；
+    // 進店採集改為補充，不再作為唯一入庫來源。
+    if (qualifiedCards.length && SearchCardPush.enabled()) {
+      const n = await SearchCardPush.flush(qualifiedCards, log, sel.loc === "overseas" ? "海外" : "台灣");
+      if (n) selLog(log, `📤 搜索頁卡片直接入庫：${n} 個（詞：${sel.kw || "-"}）`);
+    }
     if (!pending.length) {
       sel.refilteredCurrent = true;
       // ★ SearchEmptyGuard：本頁 0 合格商品，累計空頁；連續超限則跳過該關鍵詞（防空轉）
