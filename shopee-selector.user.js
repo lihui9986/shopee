@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.18（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.20（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.19
+// @version      4.2.20
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -107,6 +107,66 @@
     if (!result.ok) throw new Error(result.error || "服務器返回錯誤");
     return result;
   }
+
+  // ===== MODULE: Worker 多標籤派詞（對接服務端 xuanpin_workers 租約模塊） =====
+  // 職責：每個標籤從服務端領一個「別人沒在跑」的關鍵詞、每 60 秒心跳續租、停止時釋放。
+  // 價格/銷量等硬規則不走這裡（仍由 xuanpin_filter 在入庫時判定）。
+  const Worker = {
+    keyword: "",
+    _timer: null,
+    _count: 0,
+    id() {
+      let v = tabStore.getItem("sp_worker_id");
+      if (!v) {
+        v = "w" + Math.random().toString(36).slice(2, 10);
+        tabStore.setItem("sp_worker_id", v);
+      }
+      return v;
+    },
+    _post(path, body) {
+      return serverCall(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: loadSettings().token, ...body }),
+      });
+    },
+    // 領詞：preferred 有值＝優先用自己的詞；返回 "" 表示服務端沒有可派發的詞
+    async claim(log, preferred) {
+      try {
+        const r = await this._post("/api/crawler/workers/claim", { workerId: this.id(), keyword: preferred || "" });
+        if (r && r.keyword) {
+          this.keyword = r.keyword;
+          if (log) log(`🧩 派詞：本標籤領到「${r.keyword}」${r.reused ? "（續用上次的）" : ""}`);
+          return r.keyword;
+        }
+        if (log) log("⚠️ 服務端沒有可派發的關鍵詞（詞庫空或已被其他標籤占滿），請在面板手填");
+        return "";
+      } catch (e) {
+        if (log) log(`⚠️ 派詞失敗：${e.message}（改用手填關鍵詞）`);
+        return "";
+      }
+    },
+    startHeartbeat(intervalMs) {
+      this.stopHeartbeat();
+      this._timer = setInterval(() => {
+        this._post("/api/crawler/workers/heartbeat", { workerId: this.id(), productCount: this._count })
+          .catch(() => { /* 心跳失敗不影響採集 */ });
+      }, intervalMs || 60000);
+    },
+    stopHeartbeat() {
+      if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    },
+    bump(n) { this._count += Number(n) || 0; },
+    async release(log) {
+      this.stopHeartbeat();
+      try {
+        const r = await this._post("/api/crawler/workers/release", { workerId: this.id() });
+        if (log && r && r.keyword) log(`🔓 已釋放關鍵詞「${r.keyword}」，其他標籤可接`);
+      } catch (_) { /* 釋放失敗等租約到期自動回收 */ }
+    },
+  };
+
+  function workerId() { return Worker.id(); }
 
   // 內存保護：捕獲包只保留最近 cap 個（正常流程遠低於上限，僅防長時間不刷新頁面的失控堆積）
   function pushCapped(arr, value, cap) {
@@ -545,9 +605,15 @@
       const result = await serverCall("/api/crawler/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: loadSettings().token, crawledAt: new Date().toISOString(), shops, sourceTag: sourceTag || "" }),
+        // 同步當前真正在跑的關鍵詞（切詞後 sel.kw 會變，這裡讀最新的選品狀態）
+        ...(() => {
+          try { const st = JSON.parse(tabStore.getItem(SELECT_STATE_KEY) || "{}"); if (st && st.kw) Worker.keyword = st.kw; } catch (_) {}
+          return {};
+        })(),
+        body: JSON.stringify({ token: loadSettings().token, crawledAt: new Date().toISOString(), shops, sourceTag: sourceTag || "", workerId: workerId(), keyword: Worker.keyword }),
       });
-      log(`✅ 已入庫：批次 #${result.runId}，${result.shops} 店鋪 / ${result.products} 商品`);
+      log(`✅ 已入庫：批次 #${result.runId}，${result.shops} 店鋪 / ${result.products} 商品${Worker.keyword ? `（詞：${Worker.keyword}）` : ""}`);
+      if (result.products) Worker.bump(result.products);
       if (result.duplicates) log(`⚠️ 提醒：其中 ${result.duplicates} 個商品之前已採集過，本次記錄為最新批次`);
       // 數據已交給工作台，釋放捕獲包，避免同一頁面連續任務時內存持續堆積
       //（已合併進 seen 的輕量商品對象由 seen 持有，不受清空影響；後續流程都用跳頁，會重新捕獲）
@@ -776,8 +842,7 @@
       '<div class="sp-log" style="max-height:200px;overflow:auto;background:#f7f7f7;border-radius:4px;padding:6px;white-space:pre-wrap"></div>' +
         '<div style="margin:8px 0 4px;border-top:1px dashed #ddd;padding-top:6px">' +
       '<div style="font-weight:bold;color:#2b6cb0;margin-bottom:4px">選品模式（自動搜索→進店→採集）</div>' +
-      '<input class="sp-sel-kw" autocomplete="off" placeholder="搜索關鍵詞（多個用逗號分隔，如：包包,手機殼）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
-      '<button class="sp-hot" style="width:100%;margin-bottom:4px;background:#e74c3c;color:#fff;border:0;border-radius:4px;padding:5px;cursor:pointer;font-size:12px">🔥 一鍵填入昨日爆品 Top15</button>' +
+      '<input class="sp-sel-kw" autocomplete="off" placeholder="搜索關鍵詞（多個用逗號分隔，如：包包,手機殼；留空＝自動向服務端領一個專屬詞）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<div style="margin-bottom:4px">' +
       '<input class="sp-sel-min" autocomplete="off" placeholder="價格≥" style="width:49%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:5px 8px;font-size:12px">' +
       '<input class="sp-sel-maxp" autocomplete="off" placeholder="價格≤" style="width:49%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:5px 8px;font-size:12px">' +
@@ -841,35 +906,6 @@
     prefill(".sp-sel-pages", "maxPages", 30, true);
     const locEl = panel.querySelector(".sp-sel-loc");
     if (locEl) locEl.value = selGet("loc", "tw") === "overseas" ? "overseas" : "tw";
-    // 🔥 一鍵填入昨日爆品
-    panel.querySelector(".sp-hot").addEventListener("click", async () => {
-      const btn = panel.querySelector(".sp-hot");
-      btn.disabled = true; btn.textContent = "⏳ 載入中…";
-      try {
-        const s = loadSettings();
-        const srv = (s.server || "").replace(/\/+$/, "");
-        const resp = await new Promise((resolve, reject) => {
-          GM_xmlhttpRequest({
-            method: "GET", url: srv + "/api/hot-products",
-            headers: { "X-Crawler-Token": s.token || "" }, timeout: 10000,
-            onload: (r) => { try { resolve(JSON.parse(r.responseText)); } catch(_) { reject(new Error("解析失敗")); } },
-            onerror: () => reject(new Error("網絡錯誤")),
-          });
-        });
-        if (resp.ok && resp.products && resp.products.length) {
-          const kwEl = panel.querySelector(".sp-sel-kw");
-          kwEl.value = resp.products.join(",");
-          kwEl.dispatchEvent(new Event("input", { bubbles: true }));
-          log(`🔥 已填入 ${resp.products.length} 個昨日爆品關鍵詞`);
-        } else {
-          log("⚠️ 沒有查到昨日爆品數據");
-        }
-      } catch (e) {
-        log("❌ 獲取爆品失敗: " + e.message);
-      } finally {
-        btn.disabled = false; btn.textContent = "🔥 一鍵填入昨日爆品 Top15";
-      }
-    });
     autoCheck.checked = Boolean(settings.autoCheck);
     const saveFromInputs = () => {
       const server = serverInput.value.trim();
@@ -903,7 +939,7 @@
       panel.querySelector(".sp-due").disabled = state.running;
       panel.querySelector(".sp-here").disabled = state.running;
     };
-    const finishTask = () => { state.running = false; toggleRunning(); };
+    const finishTask = () => { state.running = false; toggleRunning(); Worker.release(log); };
     panel.querySelector(".sp-sync").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); startSyncAllMode(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); sendNotify("💥 抓取任務異常", m); }).finally(finishTask); } });
     panel.querySelector(".sp-due").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); startDueMode(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); }).finally(finishTask); } });
     panel.querySelector(".sp-here").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); captureHereWithFreshFilters(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); }).finally(finishTask); } });
@@ -915,6 +951,7 @@
       discardSelectTask();
       setStatus("選品模式：已停止");
       log("⏹ 選品已停止（任務緩存已清除，不續跑）");
+      Worker.release(log);
     });
     panel.querySelector(".sp-sel-pause").addEventListener("click", () => {
       const sel = loadSelectState();
@@ -924,8 +961,9 @@
       state.running = false;
       setStatus("選品模式：已暫停");
       log("⏸ 已暫停——進度已保存，點「繼續」恢復運行");
+      Worker.release(log);   // 暫停時交還關鍵詞，讓別的標籤可以接手
     });
-    panel.querySelector(".sp-sel-resume").addEventListener("click", () => {
+    panel.querySelector(".sp-sel-resume").addEventListener("click", async () => {
       const sel = loadSelectState();
       if (!sel || !sel.paused) { log("沒有已暫停的選品任務"); return; }
       sel.paused = false;
@@ -933,6 +971,10 @@
       state.running = true;
       setStatus("選品模式：繼續");
       log("▶ 繼續運行未完成任務…");
+      const back = await Worker.claim(log, sel.kw || "");
+      if (back) Worker.keyword = back;
+      Worker._count = 0;
+      Worker.startHeartbeat(60000);
       continueSelectMode(log);
     });
     for (const [cls, key, numeric] of [[".sp-sel-kw", "kw"], [".sp-sel-min", "min"], [".sp-sel-maxp", "maxPrice"], [".sp-sel-sold", "minSold"], [".sp-sel-maxsold", "maxSold"], [".sp-sel-stores", "stores", 1], [".sp-sel-minpage", "minPage", 1], [".sp-sel-pages", "maxPages", 1], [".sp-sel-loc", "loc"]]) {
@@ -952,10 +994,10 @@
       continueSelectMode(log).catch((e) => { const msg = `💥 續跑異常: ${e && e.message ? e.message : e}`; log(msg); setStatus(msg); dbgLog(msg); });
       return;
     }
-    // 自動循環：首頁載入時如果循環模式開著，自動拉爆款列表開始
+    // 自動循環：首頁載入時如果循環模式開著，自動開始選品（關鍵詞由服務端派發，面板留空即可）
     if (tabStore.getItem("sp_crawler_loop") === "1" && (location.pathname === "/" || location.pathname === "")) {
-      log("🔄 循環模式：自動拉取最新爆款列表...");
-      setTimeout(() => document.querySelector(".sp-hot")?.click(), 3000);
+      log("🔄 循環模式：自動開始選品（留空關鍵詞＝向服務端領一個專屬詞）");
+      setTimeout(() => document.querySelector(".sp-sel-start-tw")?.click(), 3000);
       return;
     }
     // 定時補抓：開關打開時，首頁載入後自動檢查到期店鋪並開始抓取
@@ -2138,11 +2180,23 @@
     };
     let kwRaw = ((document.querySelector(".sp-sel-kw") || {}).value || selGet("kw", ""));
     if (/^https?:\/\//.test(kwRaw.trim())) kwRaw = "";
+    // 面板留空 → 向服務端領一個專屬關鍵詞（多標籤各領不同詞，見 xuanpin_workers）
+    if (!kwRaw.trim()) {
+      const claimed = await Worker.claim(log, "");
+      if (claimed) {
+        kwRaw = claimed;
+        const kwEl = document.querySelector(".sp-sel-kw");
+        if (kwEl) kwEl.value = claimed;
+      }
+    }
     // 解析多關鍵詞：支援逗號/頓號分隔
     const kwList = kwRaw.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean);
-    if (!kwList.length) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
+    if (!kwList.length) { selLog(log, "❌ 請填寫搜索關鍵詞（或讓服務端派詞：面板留空、服務端詞庫非空）"); return; }
     const kw = kwList[0];
-    selLog(log, `📋 共 ${kwList.length} 個關鍵詞：${kwList.join("、")}`);
+    Worker.keyword = kw;
+    Worker._count = 0;
+    Worker.startHeartbeat(60000);
+    selLog(log, `📋 共 ${kwList.length} 個關鍵詞：${kwList.join("、")}（Worker ${Worker.id()}）`);
     const min = Math.max(0, Number(((document.querySelector(".sp-sel-min") || {}).value) || selGet("min", 200)));
     const maxStores = Math.max(1, Math.min(50, Number(((document.querySelector(".sp-sel-stores") || {}).value) || 50)));
     const minPage = Math.max(1, Math.min(200, Number(((document.querySelector(".sp-sel-minpage") || {}).value) || selGet("minPage", 5))));
