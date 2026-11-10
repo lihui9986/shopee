@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         蝦皮選品器 v4.2.18（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.18
-// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」
+// @version      4.2.19
+// @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -375,7 +375,11 @@
     return pickShopInfoDom();
   }
 
-  async function scrollCollect(seen, log) {
+  // v4.2.19：opts = { kw, onPage } —— onPage(本輪新讀到的商品[]) 每滾動一輪回調，用於滾動增量入庫。
+  // 回傳 "empty" = 空店快速止損（首屏全部與關鍵詞無關，整店大概率採不到，提前結束省時間）。
+  async function scrollCollect(seen, log, opts) {
+    const kw = opts && opts.kw;
+    const onPage = opts && opts.onPage;
     let lastCount = -1;
     let stable = 0;
     let round = 0;
@@ -383,8 +387,24 @@
       window.scrollTo(0, document.body.scrollHeight);
       await sleep(1200);
       round += 1;
+      const beforeKeys = new Set(seen.keys());
       scrapeDomInto(seen);
       mergeApiItems(seen);
+      // ===== v4.2.19 B：空店快速止損 =====
+      // 首屏已載 ≥8 個商品且全部與關鍵詞無關 → 月銷排序下最熱商品都不相關，後續頁更不可能有 → 直接判空店跳店
+      if (round === 1 && kw && seen.size >= 8) {
+        const anyRelated = [...seen.values()].some((it) => matchKeyword(it.name, kw));
+        if (!anyRelated) {
+          log(`⚡ 空店快速止損：首屏 ${seen.size} 個商品均與關鍵詞無關，跳過本店`);
+          return "empty";
+        }
+      }
+      // ===== v4.2.19 A：滾動增量入庫 =====
+      // 本輪新讀到的商品立即交給回調推送（斷線/崩潰/關標籤只丟最後一輪，不再整店白採）
+      if (onPage && seen.size > beforeKeys.size) {
+        const fresh = [...seen.values()].filter((it) => !beforeKeys.has(it.itemid));
+        await onPage(fresh);
+      }
       if (seen.size === lastCount) stable += 1; else stable = 0;
       lastCount = seen.size;
       log(`   已讀取 ${seen.size} 個商品（第 ${round} 輪）`);
@@ -1956,22 +1976,66 @@
     }
     selLog(log, `📥 採集賣場「${username}」月銷熱賣商品…`);
     const seen = new Map();
-    await scrollCollect(seen, log);
-    // 店內卡片到貨標識
+    // ===== v4.2.19 A：滾動增量入庫（僅海外模式；台灣模式有「快速到貨」徽標過濾需整店掃完判定，保持整店推送原路徑）=====
+    const incremental = sel.mode !== "tw";
+    const pushedIds = new Set();        // 已成功入庫的 itemid（尾輪匯總時排除，不重複推）
+    const retryQueue = [];              // 推送失敗（服務器不可達）的批次，下輪自動重試
+    let incPushes = 0;                  // 成功推送次數
+    const apiMapInc = new Map();        // API 補充資訊快取：pushShops 會清 captured.items，快取保證後續輪的品牌/優選過濾不降級
+    const emitPage = async (fresh) => {
+      if (!incremental || state.running === false) return;
+      const candidates = (fresh || []).filter((it) => !pushedIds.has(it.itemid));
+      if (!candidates.length && !retryQueue.length) return;
+      const apiMap = buildApiItemMap();
+      for (const [k, v] of apiMap) apiMapInc.set(k, v);
+      const batch = [...retryQueue.splice(0, retryQueue.length), ...candidates].filter((item) => {
+        if (pushedIds.has(item.itemid)) return false;
+        const basic = apiMapInc.get(Number(item.itemid)) || null;
+        const res = qualifyItem(item, {
+          keyword: sel.kw,                                                          // 與整店匯總完全同一套條件
+          priceMin: sel.min > 0 ? sel.min : null,
+          priceMax: sel.maxPrice > 0 ? sel.maxPrice : null,
+          soldMin: sel.minSold > 0 ? sel.minSold : null,
+          soldMax: sel.maxSold > 0 ? sel.maxSold : null,
+          histMin: null, histMax: null,
+          rejectNoSignal: true,
+          checkShop: true, checkBrand: true,
+          apiItem: basic,
+          deliveryMode: null, deliveryOk: true,                                     // 海外模式無到貨徽標過濾
+        });
+        return res.pass;
+      });
+      if (!batch.length) return;
+      const ok = await pushShops([{ username, shop_info: info || { username }, items: batch }], log, sel.loc === "overseas" ? "海外" : "台灣");
+      if (ok) { incPushes += 1; batch.forEach((it) => pushedIds.add(it.itemid)); }
+      else { retryQueue.push(...batch); selLog(log, `   ⚠️ 本輪 ${batch.length} 個入庫失敗（服務器不可達？），下一輪自動重試`); }
+    };
+    const collectResult = await scrollCollect(seen, log, { kw: sel.kw, onPage: emitPage });
+    // ===== v4.2.19 B：空店快速止損——首屏全無相關商品，整店掃下去也採不到，直接換下一個商品 =====
+    if (collectResult === "empty") {
+      selLog(log, "⚡ 空店快速止損完成，換下一個商品");
+      await selectModeNextCard(sel, log);
+      return;
+    }
+    // 店內卡片到貨標識（僅台灣模式整店路徑需要：徽標過濾要求掃完全店後統一判定）
     const deliveryOk = new Map();
-    document.querySelectorAll('a[href*="-i."]').forEach((a) => {
-      try {
-        const parsed = parseCard(a);
-        if (!parsed) return;
-        const container = a.closest("li") || a.closest('[data-sqe="link"]') || a.parentElement;
-        const text = (container.innerText || "");
-        // 店內規則（用戶定義）：默認全部符合，僅隔日到貨/隔天到等快速到貨徽標 → 拒
-        deliveryOk.set(Number(parsed.itemid), !/隔日到貨|隔天到|後天到|明天到|次日到|當天到|快速到貨/.test(text));
-      } catch (_) {}
-    });
+    if (!incremental) {
+      document.querySelectorAll('a[href*="-i."]').forEach((a) => {
+        try {
+          const parsed = parseCard(a);
+          if (!parsed) return;
+          const container = a.closest("li") || a.closest('[data-sqe="link"]') || a.parentElement;
+          const text = (container.innerText || "");
+          // 店內規則（用戶定義）：默認全部符合，僅隔日到貨/隔天到等快速到貨徽標 → 拒
+          deliveryOk.set(Number(parsed.itemid), !/隔日到貨|隔天到|後天到|明天到|次日到|當天到|快速到貨/.test(text));
+        } catch (_) {}
+      });
+    }
     const apiMap = buildApiItemMap();
+    for (const [k, v] of apiMap) apiMapInc.set(k, v);
     const items = [...seen.values()].filter((item) => {
-      const basic = apiMap.get(Number(item.itemid)) || null;
+      if (incremental && pushedIds.has(item.itemid)) return false;   // v4.2.19：已增量入庫的商品不重複計入尾輪
+      const basic = apiMapInc.get(Number(item.itemid)) || null;
       // 唯一編排入口：標題合法 + 關鍵詞相關 + 價格/銷量/總銷 + 拒全空數據 + 店鋪類型 + 配送
       const res = qualifyItem(item, {
         keyword: sel.kw,                                                          // 搜什麼就只採什麼（搜衣服直采衣服）
@@ -1989,12 +2053,43 @@
       if (!res.pass) { selLog(log, `   跳過「${(item.name || "").slice(0, 14)}…」：${res.reason}`); return false; }
       return true;
     });
+    if (state.running === false) { selLog(log, "⏸ 已暫停——本次未入庫，繼續後將重新採集本店"); return; }
+    // ===== v4.2.19 A：增量模式收尾 =====
+    if (incremental) {
+      if (items.length) {
+        selLog(log, `   條件過濾後剩 ${items.length} 個商品，尾輪推送入庫…`);
+        const okTail = await pushShops([{ username, shop_info: info || { username }, items }], log, sel.loc === "overseas" ? "海外" : "台灣");
+        if (okTail) { incPushes += 1; items.forEach((it) => pushedIds.add(it.itemid)); }
+        else { selLog(log, "   ⚠️ 尾輪入庫失敗（服務器不可達？），本店已入庫部分不受影響"); }
+      }
+      if (!pushedIds.size) {
+        if (items.length === 0 && !retryQueue.length) selLog(log, "⚠️ 該賣場沒有符合選品條件的商品");
+        else selLog(log, "❌ 本店各輪推送均失敗（服務器不可達？），換下一個商品繼續");
+        await selectModeNextCard(sel, log);
+        return;
+      }
+      sel.storesDone += 1;
+      sel.shopFailStreak = 0; // 採集成功＝頁面加載正常，重置連敗計數
+      sel.visitedShops.push(username);
+      const firstShopId = items.length && items[0].shopid ? Number(items[0].shopid) : (info && info.shopid ? Number(info.shopid) : null);
+      if (firstShopId) {
+        sel.visitedShopIds = sel.visitedShopIds || [];
+        sel.visitedShopIds.push(firstShopId);
+      }
+      rememberShopCollected(firstShopId, username);
+      if (window.__spCollectedShops) window.__spCollectedShops.push(firstShopId);
+      saveSelectState(sel);
+      setStatus(`選品：已完成 ${sel.storesDone}/${sel.maxStores} 家店`);
+      selLog(log, `✅ 本店完成：增量入庫共 ${pushedIds.size} 個商品（分 ${incPushes} 次推送）`);
+      await selectModeNextCard(sel, log);
+      return;
+    }
+    // ===== 以下為台灣模式原路徑（整店掃完一次性推送）=====
     if (!items.length) {
       selLog(log, "⚠️ 該賣場沒有符合選品條件的商品");
       await selectModeNextCard(sel, log);
       return;
     }
-    if (state.running === false) { selLog(log, "⏸ 已暫停——本次未入庫，繼續後將重新採集本店"); return; }
     selLog(log, `   條件過濾後剩 ${items.length} 個商品，推送入庫…`);
     const ok = await pushShops([{ username, shop_info: info || { username }, items }], log, sel.loc === "overseas" ? "海外" : "台灣");
     if (ok) {
