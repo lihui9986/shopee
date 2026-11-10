@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.38（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.39（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.38
+// @version      4.2.39
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -2464,7 +2464,32 @@
   }
 
 
+  // ===== v4.2.39：頁面內存回收（A 方案）=====
+  // Shopee 無限滾動會讓 DOM 與 JS 堆越跑越肥，長時間不刷新必卡死。
+  // 策略：本頁存活滿 AUTO_RELOAD_MIN 分鐘，或 JS 堆超過 AUTO_RELOAD_HEAP_MB，就在「換店」的空檔硬刷新；
+  //       刷新後 SELECT_FLAG 仍在 → 自動 continueSelectMode 續跑，已入庫數據不受影響（增量入庫已推送）。
+  window.__spPageStart = window.__spPageStart || Date.now();
+  const AUTO_RELOAD_MIN = 90;
+  const AUTO_RELOAD_HEAP_MB = 800;
+  function maybeRecyclePage(log) {
+    if (!state.running) return false;
+    if (!tabStore.getItem(SELECT_FLAG)) return false;
+    const aliveMin = (Date.now() - (window.__spPageStart || Date.now())) / 60000;
+    const mem = (window.performance && performance.memory) ? performance.memory.usedJSHeapSize / 1048576 : 0;
+    const byTime = aliveMin >= AUTO_RELOAD_MIN;
+    const byHeap = mem >= AUTO_RELOAD_HEAP_MB;
+    if (!byTime && !byHeap) return false;
+    const why = byTime ? `本頁已跑 ${Math.round(aliveMin)} 分鐘` : `JS 堆 ${Math.round(mem)}MB`;
+    const msg = `🧹 內存回收：${why}，刷新頁面後自動續跑（已入庫不受影響）`;
+    try { log(msg); } catch (_) {}
+    try { selLog(log, msg); } catch (_) {}
+    try { saveSelectState(loadSelectState()); } catch (_) {}
+    setTimeout(() => location.reload(), 800);
+    return true;
+  }
+
   async function selectModeNextCard(sel, log) {
+    if (state.running && maybeRecyclePage(log)) return;
     if (!state.running) { selLog(log, sel.paused ? "⏸ 已暫停，任務保留" : "⏹ 已停止"); return; }
     if (sel.storesDone >= sel.maxStores) { selectModeFinish(log); return; }
     if (sel.pendingCards && sel.pendingCards.length) {
