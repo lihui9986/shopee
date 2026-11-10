@@ -272,13 +272,53 @@
       return { url: "", shopid: "", reason: direct ? "首頁或#號" : "空連結" };
     },
   };
+  // ===== MODULE: ShopBadge 標題區徽標判定（優選/商城） =====
+  // 職責：判斷當前商品頁的「商品本身」是否帶 蝦皮優選 / 蝦皮商城 徽標。
+  // v4.2.31 修正：舊版拿 h1 往上 3 層父節點的整段 innerText 做 /蝦皮優選|蝦皮商城/ 正則，
+  // 商品頁那幾層常夾著店鋪卡/推薦位文字，導致幾乎每個商品都被誤判成優選店→整條跳過→長期 0 入庫。
+  // 這裡只在「緊貼標題」的小徽標上判定（img alt / 短文本且整段就是徽標詞）。
+  const ShopBadge = {
+    _words: /蝦皮優選|蝦皮商城/,
+    _short(el) {
+      if (!el) return "";
+      const t = String(el.textContent || "").trim();
+      if (!t || t.length > 12) return "";
+      const m = t.match(this._words);
+      return m ? m[0] : "";
+    },
+    // 返回 ""（無徽標）/ "蝦皮優選" / "蝦皮商城"
+    check() {
+      const h1 = document.querySelector("h1");
+      if (!h1) return "";
+      const box = h1.parentElement || h1;
+      for (const img of box.querySelectorAll("img[alt], svg[aria-label]")) {
+        const label = String(img.getAttribute("alt") || img.getAttribute("aria-label") || "").trim();
+        if (img.closest("h1")) continue;
+        if (label && label.length <= 12) {
+          const m = label.match(this._words);
+          if (m) return m[0];
+        }
+      }
+      for (const el of Array.from(box.children)) {
+        const b = this._short(el);
+        if (b) return b;
+      }
+      if (box.parentElement) {
+        for (const el of Array.from(box.parentElement.children)) {
+          const b = this._short(el);
+          if (b) return b;
+        }
+      }
+      return "";
+    },
+  };
   // ===== MODULE: Limits 選品核心參數（對接服務端 xuanpin_limits 模塊） =====
   // 職責：價格區間、月銷上下限、總銷下限、頁數上下限、店鋪上限全部由服務端模塊給，腳本只讀不寫死。
   // 以後改採多少錢、多少銷量、幾頁：只改 xuanpin_limits.py（或環境變量），腳本和後台自動跟著變。
   const Limits = {
     data: null,
     _loadedAt: 0,
-    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 50, pageHardMax: 200, storeMax: 0 },
+    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 50, pageHardMax: 200, storeMax: 0, skipPreferredShop: 0 },
     async load(log) {
       if (this.data && Date.now() - this._loadedAt < 60000) return this.data;
       try {
@@ -289,6 +329,7 @@
           histSoldMin: Number(r.histSoldMin),
           pageMin: Number(r.pageMin), pageMax: Number(r.pageMax),
           pageHardMax: Number(r.pageHardMax), storeMax: Number(r.storeMax),
+          skipPreferredShop: Number(r.skipPreferredShop) || 0,
         });
         this._loadedAt = Date.now();
         if (log) log(`⚙️ 參數模塊已載入：價格 ${this.data.priceMin}~${this.data.priceMax}｜月銷 ≥${this.data.soldMin}${this.data.soldMax ? " ≤" + this.data.soldMax : ""}｜總銷 ≥${this.data.histSoldMin}｜頁數 ${this.data.pageMin}~${this.data.pageMax}｜店鋪 ≤${this.data.storeMax}`);
@@ -2015,21 +2056,18 @@
       await selectModeNextCard(sel, log);
       return;
     }
-    // 標題區徽標檢測：優選/商城徽標就標在商品標題旁（用戶規則：有徽標直接跳過）
+    // 標題區徽標：交給 ShopBadge 模塊，只在緊貼標題的小徽標上判定
+    // （舊版掃 h1 往上 3 層整段文字，會把店鋪卡/推薦位裡的「蝦皮優選」當成本商品徽標，誤殺大量商品）
+    // 開關 skipPreferredShop：0=優選店照收（默認），1=優選店跳過；商城店一律照舊跳過
+    const badge = ShopBadge.check();
+    if (badge === "蝦皮商城" || (badge === "蝦皮優選" && Limits.get("skipPreferredShop"))) {
+      selLog(log, `⏭ 跳過${badge}店商品（標題區徽標）`);
+      await selectModeNextCard(sel, log);
+      return;
+    }
+    if (badge === "蝦皮優選") selLog(log, "🔧 命中「蝦皮優選」徽標，但開關 skipPreferredShop=0，保留該商品");
     const h1 = document.querySelector("h1");
     if (h1) {
-      let titleBox = h1.parentElement;
-      let badgeHit = "";
-      for (let i = 0; i < 3 && titleBox; i += 1) {
-        const m = (titleBox.innerText || "").match(/蝦皮優選|蝦皮商城/);
-        if (m) { badgeHit = m[0]; break; }
-        titleBox = titleBox.parentElement;
-      }
-      if (badgeHit) {
-        selLog(log, `⏭ 跳過${badgeHit}店商品（標題區徽標）`);
-        await selectModeNextCard(sel, log);
-        return;
-      }
       const sheetHit = brandSheetHit(h1.innerText || "");
       if (sheetHit) {
         selLog(log, `⏭ 跳過品牌店商品（標題含「${sheetHit}」）`);
