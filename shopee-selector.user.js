@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         蝦皮選品器 v4.2.39（台灣/海外雙選品）
+// @name         蝦皮選品器 v4.2.40（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.39
+// @version      4.2.40
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -1208,7 +1208,7 @@
     panel.querySelector(".sp-sync").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); startSyncAllMode(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); sendNotify("💥 抓取任務異常", m); }).finally(finishTask); } });
     panel.querySelector(".sp-due").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); startDueMode(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); }).finally(finishTask); } });
     panel.querySelector(".sp-here").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); captureHereWithFreshFilters(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); }).finally(finishTask); } });
-    panel.querySelector(".sp-stop").addEventListener("click", () => { state.running = false; tabStore.removeItem(AUTO_KEY); discardSelectTask(); log("⏹ 已停止（任務緩存已清除）"); });
+    panel.querySelector(".sp-stop").addEventListener("click", () => { state.running = false; tabStore.removeItem(AUTO_KEY); discardSelectTask(); log("⏹ 已停止（任務緩存已清除）"); clearHistoryCache(log); });
     panel.querySelector(".sp-sel-start-tw").addEventListener("click", () => { if (!state.running) { state.running = true; tabStore.setItem("sp_crawler_loop", "1"); toggleRunning(); startSelectMode(log, "tw").catch((e) => selLog(log, `💥 啟動異常: ${e && e.message ? e.message : e}`)).finally(finishTask); } });
     panel.querySelector(".sp-sel-start-os").addEventListener("click", () => { if (!state.running) { state.running = true; tabStore.setItem("sp_crawler_loop", "1"); toggleRunning(); startSelectMode(log, "os").catch((e) => selLog(log, `💥 啟動異常: ${e && e.message ? e.message : e}`)).finally(finishTask); } });
     panel.querySelector(".sp-sel-stop").addEventListener("click", () => {
@@ -1216,6 +1216,7 @@
       discardSelectTask();
       setStatus("選品模式：已停止");
       log("⏹ 選品已停止（任務緩存已清除，不續跑）");
+      clearHistoryCache(log);
       Worker.release(log);
     });
     panel.querySelector(".sp-sel-pause").addEventListener("click", () => {
@@ -1621,6 +1622,31 @@
       box = box.parentElement;
     }
     return false;
+  }
+
+  // v4.2.40：停止任務時自動清理歷史緩存（保留面板設置，只清採集記憶與頁內對象）
+  // 清掉的內容：店鋪採集記憶、品牌記憶、截獲的 API 包、詳情緩存、品牌內存索引。
+  // 效果：下次開始不會因為「30 天內採過」跳過老店，會重新掃一遍（已入庫商品由服務端 itemid 去重，不會重複）。
+  function clearHistoryCache(log) {
+    let shops = 0;
+    let brands = 0;
+    try { shops = (JSON.parse(localStorage.getItem(SHOP_MEMORY_KEY)) || []).length; } catch (_) {}
+    try { brands = (JSON.parse(localStorage.getItem(BRAND_MEMORY_KEY)) || []).length; } catch (_) {}
+    try { localStorage.removeItem(SHOP_MEMORY_KEY); } catch (_) {}
+    try { localStorage.removeItem(BRAND_MEMORY_KEY); } catch (_) {}
+    shopMemoryCache = null;
+    brandMemoryCache = null;
+    brandMemoryIds.clear();
+    brandMemoryLoaded = false;
+    captured.items.length = 0;
+    captured.shopBases.length = 0;
+    try { captured.itemDetails.clear(); } catch (_) {}
+    try { brandServerQueue.length = 0; } catch (_) {}
+    try { dbgQueue.length = 0; } catch (_) {}
+    if (typeof log === "function") {
+      log(`🧹 歷史緩存已清理：店鋪記憶 ${shops} 條、品牌記憶 ${brands} 條、頁內捕獲包已釋放`);
+    }
+    return { shops, brands };
   }
 
   // 店鋪採集記憶：30 天內採集過的店不再重複採集
