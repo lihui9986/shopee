@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器 v4.2.44（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.44
+// @version      4.2.45
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -28,6 +28,7 @@
  *  10. ProduceReporter    【已移除】產出計數上報（原供監控零產出檢測）
  *  11. Heartbeat         【已移除】心跳上報（原 4181 監控）
  *  12. SyncMode          同步/到期模式（抓當前店）
+ *  13. CaptureSource    採集來源統計（API / 頁面內嵌 / DOM）
  * 各 MODULE 在下方以「// ===== MODULE: 名稱 =====」標註。
  * ========================================================================== */
 
@@ -81,7 +82,8 @@
     let s = {};
     try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch (_) {}
     if (!s.server) s.server = "http://192.168.142.111:4180";
-    if (!s.token) s.token = "xk_3f824111e24061a698569f26ac0f85c9";
+    // v4.2.45：連接令牌改由使用者在面板設定，腳本不再附帶預設值
+    if (!s.token) s.token = "";
     return s;
   }
   function saveSettings(patch) {
@@ -125,7 +127,7 @@
     const settings = loadSettings();
     const server = (settings.server || "").replace(/\/+$/, "");
     const token = settings.token || "";
-    if (!server || !token) throw new Error("請先填寫伺服器地址與令牌");
+    if (!server || !token) throw new Error("請先在面板填寫伺服器地址與連接令牌");
     const headers = { "X-Crawler-Token": token, ...(options.headers || {}) };
     const result = await gmRequest(server + path, { ...options, headers });
     if (!result.ok) throw new Error(result.error || "服務器返回錯誤");
@@ -457,6 +459,89 @@
     return { items: out };
   }
 
+  // ===== v4.2.45 新增：頁面內嵌數據兜底 + 採集來源統計 =====
+  // 原本僅有「API 攔截 + DOM 解析」兩路。搜索頁接口改版或頁面未渲染時，
+  // 兩路全空會被 SearchEmptyGuard 當成「這個關鍵詞沒貨」，連續幾頁就跳詞。
+  // 這裡補上內嵌數據兜底，並記錄三路原始商品數，讓空頁判定能區分「擷取失敗」與「真的沒貨」。
+  const CaptureSource = (function () {
+    const stat = { api: 0, ssr: 0, dom: 0 };
+    return {
+      note(kind, n) { const v = Number(n) || 0; if (v > stat[kind]) stat[kind] = v; },
+      noteApi() {
+        let n = 0;
+        for (const body of captured.items) {
+          if (body && body.__spSsrBody) continue;   // 內嵌兜底包不重複計入 API
+          n += (body && body.items && body.items.length) || 0;
+        }
+        if (n > stat.api) stat.api = n;
+      },
+      hasRaw() { return stat.api + stat.ssr + stat.dom > 0; },
+      snapshot() { return { api: stat.api, ssr: stat.ssr, dom: stat.dom }; }
+    };
+  })();
+
+  // 從內嵌 JSON 樹裡找出所有 items 數組（各站點結構不一，做有限深度遍歷）
+  function ssrItemArrays(node, out, depth) {
+    if (!node || typeof node !== "object" || depth > 4) return;
+    if (Array.isArray(node.items) && node.items.length) out.push(node.items);
+    for (const key of ["data", "props", "pageProps", "initialState", "search_result", "state"]) {
+      const v = node[key];
+      if (v && typeof v === "object") ssrItemArrays(v, out, depth + 1);
+    }
+  }
+
+  // 內嵌數據裡的價格有時是顯示價（如 299），主鏈路一律用 x100000 原始刻度；
+  // 同時補 rating_star，避免只有 item_rating 對象時下游取不到評分。
+  function normalizeSsrItems(arr) {
+    return arr.map((entry) => {
+      if (!entry || typeof entry !== "object") return entry;
+      const wrapped = entry.item_basic && typeof entry.item_basic === "object";
+      const basic = wrapped ? entry.item_basic : entry;
+      let changed = false;
+      const fixed = Object.assign({}, basic);
+      if (typeof fixed.price === "number" && fixed.price > 0 && fixed.price < 100000) {
+        fixed.price = Math.round(fixed.price * 100000);
+        changed = true;
+      }
+      if (fixed.rating_star === undefined && fixed.item_rating && typeof fixed.item_rating === "object") {
+        fixed.rating_star = fixed.item_rating.rating_star ?? null;
+        changed = true;
+      }
+      if (!changed) return entry;
+      return wrapped ? Object.assign({}, entry, { item_basic: fixed }) : fixed;
+    });
+  }
+
+  // 冪等：成功抓到即鎖定；最多嘗試 3 次（DOM 可能尚未注入），失敗不影響主鏈路
+  function ensureSsrCapture() {
+    if (window.__spSsrCaptured || (window.__spSsrTries || 0) >= 3) return 0;
+    window.__spSsrTries = (window.__spSsrTries || 0) + 1;
+    let added = 0;
+    try {
+      const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+      const roots = [];
+      if (pageWindow.__INITIAL_STATE__) roots.push(pageWindow.__INITIAL_STATE__);
+      const nd = document.getElementById("__NEXT_DATA__");
+      if (nd && nd.textContent) { try { roots.push(JSON.parse(nd.textContent)); } catch (_) {} }
+      document.querySelectorAll('script[type="application/json"]').forEach((s) => {
+        try { const d = JSON.parse(s.textContent || ""); if (d) roots.push(d); } catch (_) {}
+      });
+      for (const root of roots) {
+        const arrays = [];
+        ssrItemArrays(root, arrays, 0);
+        for (const arr of arrays) {
+          const body = compactSearchBody({ items: normalizeSsrItems(arr) });
+          if (!body.items.length) continue;
+          body.__spSsrBody = true;
+          pushCapped(captured.items, body, 160);
+          added += body.items.length;
+        }
+      }
+      if (added) { CaptureSource.note("ssr", added); window.__spSsrCaptured = true; }
+    } catch (_) { /* 內嵌結構各站不一，解析失敗不影響主鏈路 */ }
+    return added;
+  }
+
   // ===== MODULE 2: NetCapture 網絡捕獲（鉤子/服務器調用/商品詳情） =====
   // 職責：攔截 Shopee API、向 4180/4181 發請求、捕獲商品與詳情；不含解析/過濾邏輯
   function installHooks() {
@@ -665,6 +750,7 @@
 
   const domParsed = new WeakSet();
   function scrapeDomInto(seen) {
+    ensureSsrCapture();   // v4.2.45：頁面內嵌數據兜底（冪等，最多 3 次）
     document.querySelectorAll('a[href*="-i."]').forEach((a) => {
       try {
         if (domParsed.has(a)) return;
@@ -1189,7 +1275,7 @@
     panel.innerHTML =
       '<div style="font-weight:bold;color:#ee4d2d;margin-bottom:6px">蝦皮選品器 v' + (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version ? GM_info.script.version : "4.2.18") + ' · 台灣/海外雙選品</div>' +
       '<input class="sp-server" autocomplete="off" placeholder="工作台地址，其他電腦填 http://伺服器IP:4180" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
-      '<input class="sp-token" autocomplete="off" placeholder="連接令牌（工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
+      '<input class="sp-token" autocomplete="off" placeholder="連接令牌（必填，工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-auto-check"> 打開蝦皮時自動補抓到期店鋪</label>' +
       '<div style="margin:6px 0;display:flex;gap:6px">' +
       '<button class="sp-sync" style="flex:2;background:#ee4d2d;color:#fff;border:0;border-radius:4px;padding:6px;cursor:pointer">同步名單並抓取</button>' +
@@ -1240,6 +1326,15 @@
     const autoCheck = panel.querySelector(".sp-auto-check");
     serverInput.value = settings.server || "";
     tokenInput.value = settings.token || "";
+    // v4.2.45：未設定令牌時明確提示，避免看起來在跑、其實回傳都被拒
+    if (!settings.token) {
+      tokenInput.placeholder = "必填｜請從工作台爬蟲欄目複製連接令牌";
+      tokenInput.style.borderColor = "#e53e3e";
+      tokenInput.addEventListener("input", () => {
+        tokenInput.style.borderColor = tokenInput.value.trim() ? "#ccc" : "#e53e3e";
+      });
+      setStatus("⚠️ 尚未設定連接令牌：請先在面板填寫，否則入庫、通知與記憶同步都會被拒絕");
+    }
     // 選品參數記憶：自動回填上一次使用的值
     const selGet = (key, fallback) => {
       const v = tabStore.getItem("sp_sel_" + key);
@@ -1357,7 +1452,7 @@
     panel.querySelector(".sp-bye").addEventListener("click", () => panel.remove());
 
     // 選品模式續跑：標誌存在時任何頁面載入都繼續流程
-    if (!window.__spDbgLoop && loadSettings().token) { window.__spDbgLoop = true; dbgCommandLoop(); }
+    // v4.2.45：調試指令輪詢已停用
     if (tabStore.getItem(SELECT_FLAG)) {
       log("🔁 選品模式繼續…");
       continueSelectMode(log).catch((e) => { const msg = `💥 續跑異常: ${e && e.message ? e.message : e}`; log(msg); setStatus(msg); dbgLog(msg); });
@@ -1391,12 +1486,14 @@
   // ===== MODULE 6: SelectFSM 選品狀態機（關鍵詞→搜索→商品→進店→下一個） =====
   // 職責：協調選品採集全流程；僅調用 Filter/Memory/SearchEmptyGuard/LoopGuard 等模塊，不直接實現過濾/記憶邏輯
   // ==================== 選品模式（關鍵詞→搜索→最後頁向前→進店採集） ====================
-  // 遠程調試通道：選品日誌同步到本機調試服務，管理員可實時觀察並下發檢測指令
+  // 調試日誌通道：選品日誌同步到本機調試服務
   let dbgQueue = [];
   let dbgBusy = false;
   function dbgPost(path, body) {
     const settings = loadSettings();
     const server = (settings.server || "").replace(/\/+$/, "");
+    // v4.2.45：未設定令牌時不上報日誌
+    if (!server || !settings.token) return Promise.resolve(false);
     return new Promise((resolve) => {
       GM_xmlhttpRequest({
         method: "POST",
@@ -1421,32 +1518,7 @@
     dbgQueue.push(text);
     dbgFlush();
   }
-  async function dbgCommandLoop() {
-    // 長輪詢取指令：eval 任意檢測代碼並回傳結果（僅調試期間開啟）
-    while (true) {
-      const settings2 = loadSettings();
-      const server2 = (settings2.server || "").replace(/\/+$/, "");
-      const raw = await new Promise((resolve) => {
-        GM_xmlhttpRequest({
-          method: "GET",
-          url: `${server2}/api/profit/select-debug/cmd`,
-          headers: { "X-Crawler-Token": settings2.token || "" },
-          timeout: 30000,
-          onload: (r) => { try { resolve(JSON.parse(r.responseText)); } catch (_) { resolve(null); } },
-          onerror: () => resolve(null),
-          ontimeout: () => resolve(null),
-        });
-      });
-      if (raw && raw.code) {
-        let result = "";
-        try { result = String(await eval(raw.code)); }
-        catch (e) { result = "ERROR: " + (e && e.message); }
-        dbgPost("/result", { id: raw.id, result: result.slice(0, 7000) });
-      }
-      // 成功 400ms 輪詢；失敗/超時退避 5s，避免工作台關閉時高頻空打
-      await sleep(raw ? 3000 : 5000);
-    }
-  }
+  // v4.2.45：調試指令輪詢已停用，僅保留單向日誌上報。
 
 
   // ---- 郵件通知：完成/異常/風控時推送 ----
@@ -2097,7 +2169,11 @@
         if (pending.length >= 40) break;
       } catch (_) {}
     }
-    selLog(log, `   本頁符合條件商品：${pending.length} 個`);
+    // v4.2.45：統計採集來源，讓空頁判定能區分「沒抓到資料」與「真的沒貨」
+    CaptureSource.noteApi();
+    CaptureSource.note("dom", cards.length);
+    const srcStat = CaptureSource.snapshot();
+    selLog(log, `   本頁符合條件商品：${pending.length} 個｜來源 API=${srcStat.api} 內嵌=${srcStat.ssr} DOM=${srcStat.dom}`);
     // ===== v4.2.34：搜索頁合格卡片直接入庫（進店全店按關鍵詞卡死的破解路徑）=====
     // 這些卡片已過：關鍵詞搜索結果、價格 200~1000、月銷、商城/優選徽標、品牌記憶、違禁類目；
     // 進店採集改為補充，不再作為唯一入庫來源。
@@ -2107,6 +2183,21 @@
     }
     if (!pending.length) {
       sel.refilteredCurrent = true;
+      // v4.2.45：三路均未取得原始商品 = 擷取失敗（頁面未渲染 / 風控 / 接口改版），不是「這個詞沒貨」。
+      // 不計空頁、不跳詞，改走刷新重試；最多 2 次，避免無限刷新。
+      if (!CaptureSource.hasRaw()) {
+        const captureRetry = (sel.captureRetry || 0) + 1;
+        if (captureRetry <= 2) {
+          sel.captureRetry = captureRetry;
+          SearchEmptyGuard.reset(sel.kw);
+          saveSelectState(sel);
+          selLog(log, `⚠️ 三路均未取得原始商品 → 判定為擷取失敗，不計空頁；第 ${captureRetry}/2 次刷新重試`);
+          await humanSleep(2500);
+          location.reload();
+          return;
+        }
+        selLog(log, "❌ 連續 2 次刷新仍無原始商品，交回原空頁流程");
+      }
       // ★ SearchEmptyGuard：本頁 0 合格商品，累計空頁；連續超限則跳過該關鍵詞（防空轉）
       if (SearchEmptyGuard.onEmptyPage(sel.kw)) {
         selLog(log, `⏭ 關鍵詞「${sel.kw}」連續 ${SearchEmptyGuard.LIMIT} 頁 0 合格商品，跳過該詞（防空轉）`);
@@ -2117,6 +2208,7 @@
       await selectModeNextPage(sel, log);
       return;
     }
+    sel.captureRetry = 0;   // v4.2.45：本頁成功取到商品，清零擷取失敗重試計數
     sel.pendingCards = pending;
     sel.phase = "product";
     saveSelectState(sel);
@@ -2625,7 +2717,7 @@
   }
 
   async function startSelectMode(log, mode) {
-    if (!window.__spDbgLoop) { window.__spDbgLoop = true; dbgCommandLoop(); }
+    // v4.2.45：調試指令輪詢已停用
     // 每個任務開頭換一個新的標籤 ID：避免「複製標籤頁」把 sessionStorage 裡的舊 ID 一起帶過來，
     // 導致多個標籤在後台顯示成同一個（後台只看到 1 個標籤、店鋪派工失效）。
     // 每個任務開頭換一個新的標籤 ID：避免「複製標籤頁」把 sessionStorage 裡的舊 ID 一起帶過來，
