@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器 v4.2.44（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.45
+// @version      4.2.46
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -1001,6 +1001,82 @@
     return kept;
   }
 
+  // ===== v4.2.46 MODULE: ImageSink — 候選圖片落盤上報（可選，失敗靜默）=====
+  // 瀏覽器沙箱無法把圖片寫到任意本機目錄，批量 GM_download 又會被 Chrome 攔截。
+  // 因此只把「已推送入庫、且後端本批有落庫」的候選圖片 URL 回傳本機落盤服務
+  //（127.0.0.1:8765），由該服務下圖並寫入 inbox/images/；任何失敗都不影響
+  // 選品、入庫與心跳主流程。後端整批被品牌規則攔掉時不上報，避免污染搜圖目錄。
+  const ImageSink = (function () {
+    const ENDPOINT = "http://127.0.0.1:8765/ingest";
+    const KEY = "sp_image_sink";
+    function enabled() {
+      try { return tabStore.getItem(KEY) !== "0"; } catch (_) { return true; }
+    }
+    function collect(shops) {
+      // pushShops 的真實入庫結構：[{ username, shop_info:{shopid,username,name}, items:[...] }]
+      // 卡片批量入庫（ProduceReporter）與所有歷史呼叫點皆為此結構；舊的
+      // { shopid, products:[...] } 只作相容保留。缺 shopid 時從 shop_<id> 佔位符補。
+      function shopMeta(s) {
+        const info = (s && s.shop_info) || {};
+        let sid = String(s.shopid || s.shopId || info.shopid || "");
+        const username = String(s.username || info.username || s.shop_username || "");
+        if (!sid) {
+          const m = username.match(/^shop_(\d+)$/);
+          if (m) sid = m[1];
+          else if (/^\d+$/.test(username)) sid = username;
+        }
+        return {
+          shopid: sid,
+          shop_name: String(info.name || s.shop_name || username || ""),
+          shop_username: username
+        };
+      }
+      const out = [];
+      const seen = new Set();
+      const take = (p, meta) => {
+        if (!p) return;
+        const itemid = String(p.itemid || p.itemId || "");
+        const image = String(p.image || "");
+        if (!itemid || !image || !/^https?:\/\//.test(image) || seen.has(itemid)) return;
+        seen.add(itemid);
+        out.push({
+          itemid: itemid,
+          shopid: String(p.shopid || p.shopId || meta.shopid || ""),
+          shop_name: String(p.shop_name || p.shopName || meta.shop_name || ""),
+          shop_username: String(p.shop_username || meta.shop_username || ""),
+          url: String(p.url || ""),
+          image: image,
+          price: p.price,
+          sold: p.sold,
+          name: String(p.name || ""),
+          crawled_at: new Date().toISOString()
+        });
+      };
+      for (const s of (Array.isArray(shops) ? shops : [])) {
+        const meta = shopMeta(s);
+        const list = (s && (s.items || s.products)) || [];
+        for (const p of (Array.isArray(list) ? list : [])) take(p, meta);
+        if (s && (s.itemid || s.image)) take(s, meta);
+      }
+      return out;
+    }
+    function report(shops) {
+      if (!enabled()) return;
+      const items = collect(shops);
+      if (!items.length || typeof GM_xmlhttpRequest !== "function") return;
+      try {
+        GM_xmlhttpRequest({
+          method: "POST", url: ENDPOINT,
+          headers: { "Content-Type": "application/json" },
+          data: JSON.stringify({ items: items }),
+          timeout: 3000,
+          onload: function () {}, onerror: function () {}, ontimeout: function () {}
+        });
+      } catch (_) {}
+    }
+    return { report: report, enabled: enabled, collect: collect };
+  })();
+
   async function pushShops(shops, log, sourceTag) {
     try {
       const result = await serverCall("/api/crawler/ingest", {
@@ -1014,6 +1090,7 @@
         body: JSON.stringify({ token: loadSettings().token, crawledAt: new Date().toISOString(), shops, sourceTag: sourceTag || "", workerId: workerId(), keyword: Worker.keyword }),
       });
       log(`✅ 已入庫：批次 #${result.runId}，${result.shops} 店鋪 / ${result.products} 商品${Worker.keyword ? `（詞：${Worker.keyword}）` : ""}`);
+      if (result.products > 0) { try { ImageSink.report(shops); } catch (_) {} }
       if (result.products) Worker.bump(result.products);
       if (result.duplicates) log(`⚠️ 提醒：其中 ${result.duplicates} 個商品之前已採集過，本次記錄為最新批次`);
       // 數據已交給工作台，釋放捕獲包，避免同一頁面連續任務時內存持續堆積
@@ -1277,6 +1354,7 @@
       '<input class="sp-server" autocomplete="off" placeholder="工作台地址，其他電腦填 http://伺服器IP:4180" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<input class="sp-token" autocomplete="off" placeholder="連接令牌（必填，工作台爬虫欄目複製）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-auto-check"> 打開蝦皮時自動補抓到期店鋪</label>' +
+      '<label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><input type="checkbox" class="sp-image-sink"> 候選圖片落盤（需本機 image_sink 服務）</label>' +
       '<div style="margin:6px 0;display:flex;gap:6px">' +
       '<button class="sp-sync" style="flex:2;background:#ee4d2d;color:#fff;border:0;border-radius:4px;padding:6px;cursor:pointer">同步名單並抓取</button>' +
       '<button class="sp-due" style="flex:1;background:#b7791f;color:#fff;border:0;border-radius:4px;padding:6px;cursor:pointer">到期補抓</button>' +
@@ -1382,6 +1460,15 @@
       saveSettings({ autoCheck: autoCheck.checked });
       log(autoCheck.checked ? "✅ 已開啟自動補抓：打開蝦皮頁面時會自動抓取到期店鋪" : "已關閉自動補抓");
     });
+
+    const imageSinkCheck = panel.querySelector(".sp-image-sink");
+    if (imageSinkCheck) {
+      imageSinkCheck.checked = ImageSink.enabled();
+      imageSinkCheck.addEventListener("change", () => {
+        try { tabStore.setItem("sp_image_sink", imageSinkCheck.checked ? "1" : "0"); } catch (_) {}
+        log(imageSinkCheck.checked ? "✅ 已開啟候選圖片落盤上報（需本機服務 127.0.0.1:8765）" : "已關閉候選圖片落盤上報");
+      });
+    }
 
     const logBox = panel.querySelector(".sp-log");
     const statusBox = panel.querySelector(".sp-status");
