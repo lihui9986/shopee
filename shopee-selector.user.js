@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器 v4.2.44（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.51
+// @version      4.2.52
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -71,6 +71,10 @@
   const tabStore = sessionStorage;
   const DAY_MS = 24 * 60 * 60 * 1000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // v4.2.52：仿人節奏——在基礎 ms 上疊加 ±ratio 隨機（默認 ±50%），打破機械定時
+  const jit = (ms, ratio = 0.5) => sleep(Math.round(ms * (1 + (Math.random() * 2 - 1) * ratio)));
+  // 同上，但返回隨機毫秒數（用於 setTimeout 的延遲引數，setTimeout 只接受數字）
+  const jitMs = (ms, ratio = 0.5) => Math.round(ms * (1 + (Math.random() * 2 - 1) * ratio));
   const HDRS = { "x-api-source": "pc", "X-Requested-With": "XMLHttpRequest" };
   const state = { running: false };
   const captured = { shopBases: [], items: [], itemDetails: new Map() };
@@ -855,7 +859,7 @@
     let round = 0;
     while (stable < 3 && round < 80 && state.running) {
       window.scrollTo(0, document.body.scrollHeight);
-      await sleep(1200);
+      await jit(1200);
       round += 1;
       const beforeKeys = new Set(seen.keys());
       scrapeDomInto(seen);
@@ -1224,19 +1228,19 @@
     for (let i = 0; i < 24 && state.running; i += 1) {
       const title = document.title || "";
       if (title && !/shopee\.tw/i.test(title)) break;
-      await sleep(700);
+      await jit(700);
       if (i === 6 && /^shop_\d+$/i.test(username)) username = currentShopUsername() || username;
     }
     if (/^shop_\d+$/i.test(username)) username = currentShopUsername() || username;
     log(`🧲 開始讀取頁面商品：${username}（抓取條件：${describeFilters(shopEntry && shopEntry.filters)}）`);
-    await sleep(2500);
+    await jit(2500);
     const seen = new Map();
     let lastCount = -1;
     let stable = 0;
     let round = 0;
     while (stable < 3 && round < 80 && state.running) {
       window.scrollTo(0, document.body.scrollHeight);
-      await sleep(1200);
+      await jit(1200);
       round += 1;
       scrapeDomInto(seen);
       mergeApiItems(seen);
@@ -1249,13 +1253,13 @@
     if (monthlyTab) {
       log("🔁 切換到「月銷熱賣」頁簽讀取月銷量…");
       monthlyTab.click();
-      await sleep(3000);
+      await jit(3000);
       let mStable = 0;
       let mRound = 0;
       let mLast = seen.size;
       while (mStable < 3 && mRound < 80 && state.running) {
         window.scrollTo(0, document.body.scrollHeight);
-        await sleep(1200);
+        await jit(1200);
         mRound += 1;
         scrapeDomInto(seen);
         mergeApiItems(seen);
@@ -1350,13 +1354,13 @@
       // 全部采完后等60秒自动重新拉爆款列表循环
       setStatus("等待60秒後自動重新拉爆款列表...");
       log("🔄 全部完成，60秒後自動重新拉取最新爆款列表繼續採集...");
-      await sleep(60000);
+      await jit(60000, 0.3);
       location.href = "https://shopee.tw/";
       return;
     }
     state.running = true;
     setStatus(`自動模式：進行中，剩餘 ${queue.length} 家`);
-    await sleep(3000);
+    await jit(3000);
     const entry = queue[0];
     const result = await captureCurrentShop(entry, log);
     const rest = queue.slice(1);
@@ -1364,12 +1368,12 @@
     if (rest.length) {
       setStatus(`自動模式：已處理，剩餘 ${rest.length} 家`);
       log(`➡️ 3 秒後前往下一家：${rest[0].username}`);
-      await sleep(3000);
+      await jit(3000);
       location.href = buildShopUrl(rest[0].username, rest[0].shopid);
     } else {
       setStatus("等待60秒後自動重新拉爆款列表...");
       log("🔄 全部完成，60秒後自動重新拉取最新爆款列表繼續採集...");
-      await sleep(60000);
+      await jit(60000, 0.3);
       location.href = "https://shopee.tw/";
     }
   }
@@ -2420,7 +2424,7 @@
       sel.failedShops = [];
       sel.shopFailStreak = 0;
       saveSelectState(sel);
-      setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(nextKw)}`; }, 3000);
+      setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(nextKw)}`; }, jitMs(3000));
       return;
     }
     // 所有關鍵詞都跑完了：預設不自動擴詞，停止採集（避免採進用戶沒填的詞）。
@@ -2462,13 +2466,13 @@
           sel.phase = "search"; sel.jumped = false; sel.refilteredCurrent = false;
           sel.filtersApplied = false; sel.restartCount = 0; sel.emptyStep = 0;
           saveSelectState(sel);
-          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, 8000);
+          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, jitMs(8000));
         },
         onerror: () => {
           sel.kwIndex = 0; sel.kw = kwList[0];
           sel.page = 1; sel.pagesUsed = 0; sel.storesDone = 0;
           sel.phase = "search"; saveSelectState(sel);
-          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, 8000);
+          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, jitMs(8000));
         }
       });
     }
