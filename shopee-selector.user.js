@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器 v4.2.44（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.49
+// @version      4.2.50
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -1696,6 +1696,9 @@
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
       if (state.running === false) return false;
+      // v4.2.50：誤跳「使用者搜尋」或撞風控頁時立刻退出等待，
+      // 不再空轉數十秒並在錯誤頁面上繼續點擊（實測這是 04:45 風控的直接前因）
+      if (location.pathname.indexOf("/verify/") === 0 || location.pathname.indexOf("/search_user") === 0) return false;
       if (document.querySelectorAll('a[href*="-i."]').length >= minCount) { touch(); return true; }
       await sleep(700 + Math.floor(Math.random() * 700));
     }
@@ -2161,8 +2164,14 @@
       return;
     }
     // v4.2.48：機房 IP 被限流後首屏需 40~50s 才渲染卡片；舊 20s 超時會在空 DOM 上繼續跑，造成「三路皆 0」
-    const ready = await waitForCards(4, 90000);
-    if (!ready) selLog(log, "⚠️ 等待商品卡片逾時（90s），頁面可能仍在載入或被風控");
+    const ready = await waitForCards(4, 60000);
+    if (!ready) {
+      if (state.running === false) return;   // 風控硬停已處理，不再做任何動作
+      selLog(log, "⚠️ 等待商品卡片逾時（60s），頁面可能仍在載入或被風控");
+      selLog(log, "⏹ v4.2.50 卡片未渲染即結束本詞，不刷新、不重試（避免加重風控）");
+      selectModeFinish(log);
+      return;
+    }
     // 第一次：像真人一樣應用篩選（月銷熱賣→台灣→價格），然後記下蝦皮自己生成的篩選 URL
     if (!sel.filtersApplied) {
       await humanSleep(2000);
@@ -2180,41 +2189,17 @@
       if (pg && pg.total > sel.minPage && pg.cur < pg.total) {
         sel.jumped = true;
         saveSelectState(sel);
-        selLog(log, `⏭ 共 ${pg.total} 頁，像真人一樣逐頁點到最後一頁…`);
-        let stuck = 0;
-        let hops = 0;   // v4.2.48：最多翻 2 頁，避免對 17 頁結果連點十幾次觸發風控
-        while (state.running) {
-          if (hops >= 2) { selLog(log, "⏹ v4.2.48 節流：最多翻 2 頁，停止繼續點下一頁"); break; }
-          const info = findPagerInfo();
-          if (!info || info.cur >= info.total) { sel.page = info ? info.cur : sel.page; break; }
-          const before = info.cur;
-          const nextBtn = findPagerNext(info.el);
-          if (!nextBtn) { selLog(log, "⚠️ 沒找到下一頁按鈕，改用網址翻頁"); break; }
-          nextBtn.click();
-          hops += 1;
-          await waitForCards(4, 90000);   // v4.2.48：等新頁真的渲染出卡片再判斷
-          const after = findPagerInfo();
-          if (after && after.cur === before) {
-            stuck += 1;
-            selLog(log, `⚠️ 第 ${before} 頁點擊無效（第 ${stuck} 次），改用網址翻頁`);
-            if (stuck >= 2) break;
-          }
-          sel.page = after ? after.cur : before + 1;
-          if (sel.page % 3 === 0) selLog(log, `   已翻到第 ${sel.page}/${info.total} 頁`);
-        }
+        // v4.2.50 [K] 不再逐頁點擊：實測會誤點「使用者」分頁跳到 /search_user，
+        // 之後在錯誤頁面連點 + 空等，最終撞 /verify/。改為一次網址跳轉到最後一頁。
+        sel.page = Math.min(pg.total, 100);
         saveSelectState(sel);
-        if (stuck >= 2) {
-          selLog(log, "↪️ 改用網址翻到最後一頁");
-          const pg2 = findPagerInfo();
-          const target = pg2 ? pg2.total : 50;
-          sel.page = Math.min(target, 100);
-          saveSelectState(sel);
-          await humanSleep(2500);
-          location.href = withPage(sel.searchUrl || `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`, sel.page);
-          return;
-        }
-        selLog(log, `✅ 已到第 ${sel.page} 頁（最後一頁），開始篩選本頁商品`);
-        await humanSleep(2000);
+        const base = (sel.searchUrl && sel.searchUrl.indexOf("/search?") >= 0)
+          ? sel.searchUrl
+          : `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`;
+        selLog(log, `⏭ 共 ${pg.total} 頁，v4.2.50 直接以網址跳到第 ${sel.page} 頁（零逐頁點擊）`);
+        await humanSleep(1800);
+        location.href = withPage(base, sel.page - 1);   // Shopee page 參數 0-based
+        return;
       } else if (pg && pg.total <= sel.minPage) {
         sel.jumped = true;
         selLog(log, `ℹ️ 篩選後僅 ${pg.total} 頁，未達頁碼下限 ${sel.minPage}，無深度頁可篩，結束`);
@@ -2398,6 +2383,7 @@
       sel.filtersApplied = false;
       sel.restartCount = 0;
       sel.emptyStep = 0;
+      sel.emptyShops = 0;
       sel.failedShops = [];
       sel.shopFailStreak = 0;
       saveSelectState(sel);
@@ -2671,6 +2657,14 @@
     }
     // ===== v4.2.19 B：空店快速止損——首屏全無相關商品，整店掃下去也採不到，直接換下一個商品 =====
     if (collectResult === "empty") {
+      sel.emptyShops = (sel.emptyShops || 0) + 1;
+      saveSelectState(sel);
+      if (sel.emptyShops >= 3) {
+        selLog(log, `⏹ v4.2.50 連續 ${sel.emptyShops} 家空店，提前結束本詞（避免無限換店製造風控）`);
+        await ShopLease.finish(shopIdHere, username, 0);
+        selectModeFinish(log);
+        return;
+      }
       selLog(log, "⚡ 空店快速止損完成，換下一個商品");
       // ===== v4.2.35 LoopGuard：空店離場也要結清店鋪租約 =====
       // 之前漏了這一步：租約一直掛在 running，看板顯示「這家在採」、別的標籤 30 分鐘內也領不到，
@@ -2958,6 +2952,14 @@
       Worker.startHeartbeat(60000);
       setStatus(`選品模式：${sel.phase === "search" ? "搜索篩選" : sel.phase === "product" ? "查看商品" : "採集店鋪"}（完成 ${sel.storesDone || 0}/${sel.maxStores}）`);
       selLog(log, `🔁 選品續跑：階段=${sel.phase} 頁=${sel.page} 已完成店鋪=${sel.storesDone || 0}`);
+      // v4.2.50：/search_user 是誤點「使用者」分頁造成的異常頁，
+      // 不是風控，但要立刻結束本詞並寫完成標記，守護才會正常接下一詞（不重試、不發風控通知）
+      if (location.pathname.indexOf("/search_user") === 0) {
+        state.running = false;
+        selLog(log, "⏹ v4.2.50 誤入 /search_user 使用者搜尋頁，結束本詞（不會自動繼續）");
+        selectModeFinish(log);
+        return;
+      }
       // v4.2.47 RISK-STOP BEGIN
       // 用戶 2026-11-15 要求「遇到封控就停止，不要繼續」。
       // 舊版每 5 秒輪詢等待人工驗證、驗證一通過就自動續跑，
