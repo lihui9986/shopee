@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器 v4.2.44（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.46
+// @version      4.2.47
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -1560,9 +1560,11 @@
     if (tabStore.getItem(AUTO_KEY) === "1") {
       if (location.pathname.includes("/verify/")) {
         tabStore.removeItem(AUTO_KEY);
-        setStatus("自動模式被風控中斷");
-        log("❌ 蝦皮風控攔截了頁面。請稍等幾分鐘再試，或換一個節點後重新點「同步名單並抓取」。");
-        sendNotify("⚠️ 被蝦皮風控攔截", "自動抓取被風控中斷，請檢查頁面。\n時間: " + new Date().toLocaleString());
+        discardSelectTask();   // v4.2.47：連選品續跑快取一起清，不自動繼續
+        state.running = false;
+        setStatus("風控已停止自動抓取");
+        log("❌ 蝦皮風控攔截：已停止並清除續跑快取，不會自動繼續。請人工完成驗證 / 換節點後重新啟動。");
+        sendNotify("⚠️ 被蝦皮風控攔截（已停止）", "自動抓取已停止、續跑快取已清除，不會自動繼續。\n時間: " + new Date().toLocaleString());
         return;
       }
       continueAutoMode(log);
@@ -2944,24 +2946,22 @@
       Worker.startHeartbeat(60000);
       setStatus(`選品模式：${sel.phase === "search" ? "搜索篩選" : sel.phase === "product" ? "查看商品" : "採集店鋪"}（完成 ${sel.storesDone || 0}/${sel.maxStores}）`);
       selLog(log, `🔁 選品續跑：階段=${sel.phase} 頁=${sel.page} 已完成店鋪=${sel.storesDone || 0}`);
+      // v4.2.47 RISK-STOP BEGIN
+      // 用戶 2026-11-15 要求「遇到封控就停止，不要繼續」。
+      // 舊版每 5 秒輪詢等待人工驗證、驗證一通過就自動續跑，
+      // 且保留 SELECT_FLAG / sp_crawler_loop；實測 18:23~00:05 UTC 共 5.5 小時、
+      // 14 次強制換詞、約 21 條風控日誌全撞在 /verify/captcha，持續重試反而加重攔截。
+      // 改為：立即丟棄任務快取 + 釋放 worker lease，必須人工過驗證後重新點「台灣選品」。
       if (location.pathname.includes("/verify/")) {
-        setStatus("等待手動過驗證…");
-        selLog(log, "⚠️ 蝦皮風控攔截！請在手動完成驗證（滑塊/短信），完成後腳本會自動繼續。");
-        sendNotify("⚠️ 被蝦皮風控攔截", "請手動完成驗證，完成後腳本會自動繼續。\n時間: " + new Date().toLocaleString());
-        // 輪詢等待人工過驗證
         state.running = false;
-        const waitForVerify = setInterval(() => {
-          if (!tabStore.getItem(SELECT_FLAG)) { clearInterval(waitForVerify); return; }
-          if (!location.pathname.includes("/verify/")) {
-            clearInterval(waitForVerify);
-            selLog(log, "✅ 驗證已通過，自動繼續選品…");
-            setStatus("選品模式：繼續");
-            state.running = true;
-            continueSelectMode(log).catch((e) => selLog(log, `💥 恢復後異常: ${e && e.message ? e.message : e}`));
-          }
-        }, 5000);
+        discardSelectTask();
+        try { Worker.release(log); } catch (_) {}
+        setStatus("風控已停止選品，請人工過驗證後重新點「台灣選品」");
+        selLog(log, "🛑 蝦皮風控攔截：已停止並清除任務快取，不會自動繼續。請人工完成驗證 / 換節點後重新啟動。");
+        sendNotify("⚠️ 被蝦皮風控攔截（已停止）", "選品已自動停止、任務快取已清除，不會自動繼續。\n請人工完成驗證或更換節點後，再手動點「台灣選品」。\n時間: " + new Date().toLocaleString());
         return;
       }
+      // v4.2.47 RISK-STOP END
       if (sel.storesDone >= sel.maxStores) { selectModeFinish(log); return; }
       // 頁面類型判定：shop 階段且頁面是賣場（有「所有商品」導航、沒有「查看賣場」）→ 永不再找查看賣場
       const bodyText = document.body ? document.body.innerText : "";
@@ -2999,6 +2999,14 @@
     } catch (error) {
       dbgLog("💥 選品崩潰：" + (error && error.message) + " @ " + location.pathname);
       dbgFlush();
+      // v4.2.47：風控頁崩潰不再自動刷新，直接停止並清快取（不自動繼續）
+      if (location.pathname.includes("/verify/")) {
+        state.running = false;
+        discardSelectTask();
+        setStatus("風控已停止選品");
+        selLog(log, "🛑 風控頁異常：已停止並清除任務快取，不自動刷新、不自動繼續。");
+        return;
+      }
       setStatus("選品出錯，即將自動刷新恢復…");
       // 不清SELECT_FLAG，讓看門狗自動刷新恢復
       sendNotify("💥 選品腳本崩潰", "錯誤: " + (error && error.message ? error.message : error) + "\n頁面: " + location.pathname + "\n時間: " + new Date().toLocaleString());
