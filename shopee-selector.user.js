@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器 v4.2.44（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.50
+// @version      4.2.51
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -74,6 +74,27 @@
   const HDRS = { "x-api-source": "pc", "X-Requested-With": "XMLHttpRequest" };
   const state = { running: false };
   const captured = { shopBases: [], items: [], itemDetails: new Map() };
+
+  // ===== v4.2.51 全域風控鎖（跨頁面持久） =====
+  // 守護的 risk_stop.lock 只能擋住「派新詞」，擋不住油猴自己的自動補抓/續跑循環。
+  // 實測 04:55~05:02 UTC 在軟鎖存在時仍產生 29 次 /verify/，全部來自客戶端循環進店。
+  const RISK_LOCK_KEY = "sp_risk_lock_v1";
+  function riskLocked() {
+    try { return !!localStorage.getItem(RISK_LOCK_KEY); } catch (_) { return false; }
+  }
+  function setRiskLock(on) {
+    try {
+      if (on) localStorage.setItem(RISK_LOCK_KEY, new Date().toISOString());
+      else localStorage.removeItem(RISK_LOCK_KEY);
+    } catch (_) {}
+  }
+  // 頂層立即執行（@run-at document-start）：撞風控頁自動上鎖；URL 參數可主動上/解鎖
+  if (location.pathname.indexOf("/verify/") === 0) setRiskLock(true);
+  try {
+    const _q = new URLSearchParams(location.search);
+    if (_q.has("sp_unlock")) setRiskLock(false);
+    if (_q.has("sp_lock")) setRiskLock(true);
+  } catch (_) {}
 
   // ===== MODULE 9: Watchdog 看門狗 — 已按用戶要求移除（自動刷新/白屏自愈/無進展重置/凍結檢測） =====
   // 保留 touch() 作為無操作佔位：setStatus / selLog / 採集流程仍呼叫它，但不觸發任何看門狗行為。
@@ -1302,6 +1323,7 @@
 
   // 抓取到期店鋪：只抓超過週期沒抓的
   async function startDueMode(log) {
+    if (riskLocked()) { log("🔒 風控鎖生效，已阻止自動補抓啟動"); return; }
     await Limits.load(log);   // 價格/銷量門檻先取參數模塊
     const listResult = await fetchMonitorList(log);
     if (!listResult) return;
@@ -1322,6 +1344,7 @@
   }
 
   async function continueAutoMode(log) {
+    if (riskLocked()) { tabStore.removeItem(AUTO_KEY); state.running = false; return; }
     const queue = JSON.parse(tabStore.getItem(QUEUE_KEY) || "[]");
     if (!queue.length) {
       // 全部采完后等60秒自动重新拉爆款列表循环
@@ -1544,6 +1567,15 @@
     }
     panel.querySelector(".sp-bye").addEventListener("click", () => panel.remove());
 
+    // v4.2.51 [K] 全域風控鎖：撞過 /verify/ 後所有自動行為一律靜默，
+    // 直到人工完成驗證並訪問 https://shopee.tw/?sp_unlock=1 解除。
+    if (riskLocked()) {
+      tabStore.removeItem(AUTO_KEY);
+      tabStore.removeItem("sp_crawler_loop");
+      setStatus("風控鎖生效：自動採集全部暫停，請人工過驗證後解除");
+      log("🔒 風控鎖生效：不續跑、不補抓、不自動開始，請人工完成驗證後訪問 ?sp_unlock=1 解除");
+      return;
+    }
     // 選品模式續跑：標誌存在時任何頁面載入都繼續流程
     // v4.2.45：調試指令輪詢已停用
     if (tabStore.getItem(SELECT_FLAG)) {
@@ -1565,6 +1597,7 @@
     }
     if (tabStore.getItem(AUTO_KEY) === "1") {
       if (location.pathname.includes("/verify/")) {
+        setRiskLock(true);   // v4.2.51：持久化，避免下個頁面又自動補抓
         tabStore.removeItem(AUTO_KEY);
         discardSelectTask();   // v4.2.47：連選品續跑快取一起清，不自動繼續
         state.running = false;
@@ -2924,6 +2957,7 @@
   }
 
   async function continueSelectMode(log) {
+    if (riskLocked()) { state.running = false; return; }
     try {
       const sel = loadSelectState();
       if (!sel || !sel.phase || !sel.kw || sel.min === undefined || sel.maxPrice === undefined || sel.minSold === undefined || sel.maxSold === undefined || sel.maxStores === undefined || sel.minPage === undefined || sel.maxPages === undefined) {
@@ -2967,6 +3001,7 @@
       // 14 次強制換詞、約 21 條風控日誌全撞在 /verify/captcha，持續重試反而加重攔截。
       // 改為：立即丟棄任務快取 + 釋放 worker lease，必須人工過驗證後重新點「台灣選品」。
       if (location.pathname.includes("/verify/")) {
+        setRiskLock(true);   // v4.2.51：持久化，避免下個頁面又自動續跑
         state.running = false;
         discardSelectTask();
         try { Worker.release(log); } catch (_) {}
@@ -3015,6 +3050,7 @@
       dbgFlush();
       // v4.2.47：風控頁崩潰不再自動刷新，直接停止並清快取（不自動繼續）
       if (location.pathname.includes("/verify/")) {
+        setRiskLock(true);   // v4.2.51：看門狗崩潰分支也要持久化上鎖
         state.running = false;
         discardSelectTask();
         setStatus("風控已停止選品");
