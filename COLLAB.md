@@ -47,5 +47,5 @@ git -C D:\shopee\upstream log --oneline -3                # 谁提交了什么
 服务端改完：
 ```bash
 pkill -f '/opt/xuanpin/app.py'; sleep 10
-curl -s -H 'X-Crawler-Token: xk_3f824111e24061a698569f26ac0f85c9' http://192.168.139.130:4180/api/crawler/limits
+curl -s -H 'X-Crawler-Token: xk_3f824111e24061a698569f26ac0f85c9' http://206.187.214.156:4180/api/crawler/limits
 ```
