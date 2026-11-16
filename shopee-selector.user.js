@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.54
+// @version      4.2.55
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -1527,8 +1527,8 @@
     panel.querySelector(".sp-due").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); startDueMode(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); }).finally(finishTask); } });
     panel.querySelector(".sp-here").addEventListener("click", () => { if (!state.running) { saveFromInputs(); state.running = true; toggleRunning(); captureHereWithFreshFilters(log).catch((e) => { const m = `💥 任務異常: ${e && e.message ? e.message : e}`; log(m); setStatus(m); }).finally(finishTask); } });
     panel.querySelector(".sp-stop").addEventListener("click", () => { state.running = false; tabStore.removeItem(AUTO_KEY); discardSelectTask(); log("⏹ 已停止（任務緩存已清除）"); clearHistoryCache(log); });
-    panel.querySelector(".sp-sel-start-tw").addEventListener("click", () => { if (!state.running) { state.running = true; tabStore.setItem("sp_crawler_loop", "1"); toggleRunning(); startSelectMode(log, "tw").catch((e) => selLog(log, `💥 啟動異常: ${e && e.message ? e.message : e}`)).finally(finishTask); } });
-    panel.querySelector(".sp-sel-start-os").addEventListener("click", () => { if (!state.running) { state.running = true; tabStore.setItem("sp_crawler_loop", "1"); toggleRunning(); startSelectMode(log, "os").catch((e) => selLog(log, `💥 啟動異常: ${e && e.message ? e.message : e}`)).finally(finishTask); } });
+    panel.querySelector(".sp-sel-start-tw").addEventListener("click", () => { if (!state.running) { state.running = true; tabStore.setItem("sp_crawler_loop", "1"); toggleRunning(); startSelectMode(log, "tw").then((ok) => { if (ok !== true) finishTask(); }).catch((e) => { selLog(log, `💥 啟動異常: ${e && e.message ? e.message : e}`); finishTask(); }); } });
+    panel.querySelector(".sp-sel-start-os").addEventListener("click", () => { if (!state.running) { state.running = true; tabStore.setItem("sp_crawler_loop", "1"); toggleRunning(); startSelectMode(log, "os").then((ok) => { if (ok !== true) finishTask(); }).catch((e) => { selLog(log, `💥 啟動異常: ${e && e.message ? e.message : e}`); finishTask(); }); } });
     panel.querySelector(".sp-sel-stop").addEventListener("click", () => {
       state.running = false;
       discardSelectTask();
@@ -2433,6 +2433,7 @@
       selLog(log, "✅ 所有關鍵詞已採集完畢，停止（未啟用自動擴詞，不會採入未填的詞）");
       discardSelectTask();
       setStatus("選品模式：已完成（任務緩存已清除）");
+      Worker.release(log);   // v4.2.55：採集真正結束才歸還 worker 租約（原本在啟動 .finally 誤釋放）
       return;
     }
     selLog(log, `🔄 全部跑完，正在從服務器拉最新Top20爆款…`);
@@ -2878,7 +2879,7 @@
     }
     // 解析多關鍵詞：支援逗號/頓號分隔
     const kwList = kwRaw.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean);
-    if (!kwList.length) { selLog(log, "❌ 請填寫搜索關鍵詞（或讓服務端派詞：面板留空、服務端詞庫非空）"); return; }
+    if (!kwList.length) { selLog(log, "❌ 請填寫搜索關鍵詞（或讓服務端派詞：面板留空、服務端詞庫非空）"); return false; }
     const kw = kwList[0];
     Worker.keyword = kw;
     Worker._count = 0;
@@ -2904,7 +2905,7 @@
     // （v4.2.29：以前本機記憶優先，面板留空會沿用上次的舊值 1，模塊改成多少都不生效）
     const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", Limits.get("pageMax") || selGet("maxPages", 30))));
     const loc = mode === "os" ? "overseas" : "tw";
-    if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return; }
+    if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return false; }
     tabStore.setItem("sp_sel_kw", kw.trim());
     tabStore.setItem("sp_sel_min", String(min));
     tabStore.setItem("sp_sel_maxPrice", String(maxPrice));
@@ -2956,8 +2957,10 @@
       setStatus("選品模式：啟動");
       selLog(log, `🚀 ${loc === "overseas" ? "海外" : "台灣"}選品啟動：「${kw.trim()}」價格 ${min}${maxPrice ? "~" + maxPrice : "~∞"}｜月銷 ${minSold || 0}${maxSold ? "~" + maxSold : "~∞"}｜店鋪≤${maxStores}${loc === "tw" ? "｜篩到第 " + minPage + " 頁" : "｜從第 1 頁向後採 " + maxPages + " 頁"}`);
       location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(kw.trim())}`;
+      return true;   // v4.2.55：成功跳搜索頁，保留 worker 租約直到採集真正結束
     } catch (error) {
       selLog(log, `💥 啟動失敗: ${error && error.message ? error.message : String(error)}`);
+      return false;
     }
   }
 
