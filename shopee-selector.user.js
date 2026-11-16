@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.55
+// @version      4.2.56
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -1400,7 +1400,7 @@
       '<div class="sp-log" style="max-height:200px;overflow:auto;background:#f7f7f7;border-radius:4px;padding:6px;white-space:pre-wrap"></div>' +
         '<div style="margin:8px 0 4px;border-top:1px dashed #ddd;padding-top:6px">' +
       '<div style="font-weight:bold;color:#2b6cb0;margin-bottom:4px">選品模式（自動搜索→進店→採集）</div>' +
-      '<input class="sp-sel-kw" autocomplete="off" placeholder="搜索關鍵詞（多個用逗號分隔，如：包包,手機殼；留空＝自動向服務端領一個專屬詞）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
+      '<input class="sp-sel-kw" autocomplete="off" placeholder="搜索關鍵詞（必填，多個用逗號分隔，如：包包,手機殼；採完自動循環下一個）" style="width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;margin-bottom:4px">' +
       '<div style="margin-bottom:4px">' +
       '<input class="sp-sel-min" autocomplete="off" placeholder="價格≥" style="width:49%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:5px 8px;font-size:12px">' +
       '<input class="sp-sel-maxp" autocomplete="off" placeholder="價格≤" style="width:49%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:5px 8px;font-size:12px">' +
@@ -1555,8 +1555,8 @@
       state.running = true;
       setStatus("選品模式：繼續");
       log("▶ 繼續運行未完成任務…");
-      const back = await Worker.claim(log, sel.kw || "");
-      if (back) Worker.keyword = back;
+      // v4.2.56：已停用服務端派詞——續跑直接用面板已保存的詞
+      Worker.keyword = sel.kw || Worker.keyword;
       Worker._count = 0;
       Worker.startHeartbeat(60000);
       continueSelectMode(log);
@@ -1589,7 +1589,7 @@
     }
     // 自動循環：首頁載入時如果循環模式開著，自動開始選品（關鍵詞由服務端派發，面板留空即可）
     if (tabStore.getItem("sp_crawler_loop") === "1" && (location.pathname === "/" || location.pathname === "")) {
-      log("🔄 循環模式：自動開始選品（留空關鍵詞＝向服務端領一個專屬詞）");
+      log("🔄 循環模式：自動開始選品（使用面板填寫的關鍵詞，逗號分隔，採完自動循環）");
       setTimeout(() => document.querySelector(".sp-sel-start-tw")?.click(), 3000);
       return;
     }
@@ -2427,56 +2427,30 @@
       setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(nextKw)}`; }, jitMs(3000));
       return;
     }
-    // 所有關鍵詞都跑完了：預設不自動擴詞，停止採集（避免採進用戶沒填的詞）。
-    // 僅當 sel.autoExpand===true 才從工作台拉 Top20 爆款繼續輪詢。
-    if (!sel || sel.autoExpand !== true) {
-      selLog(log, "✅ 所有關鍵詞已採集完畢，停止（未啟用自動擴詞，不會採入未填的詞）");
-      discardSelectTask();
-      setStatus("選品模式：已完成（任務緩存已清除）");
-      Worker.release(log);   // v4.2.55：採集真正結束才歸還 worker 租約（原本在啟動 .finally 誤釋放）
-      return;
-    }
-    selLog(log, `🔄 全部跑完，正在從服務器拉最新Top20爆款…`);
-    if (sel) {
-      const settings0 = loadSettings();
-      const server0 = (settings0.server || "").replace(/\/+$/, "");
-      GM_xmlhttpRequest({
-        method: "GET", url: server0 + "/api/hot-products",
-        headers: { "X-Crawler-Token": settings0.token || "" }, timeout: 10000,
-        onload: (r) => {
-          try {
-            const resp = JSON.parse(r.responseText);
-            if (resp.ok && resp.products && resp.products.length) {
-              const newKw = resp.products.slice(0, 20);
-              selLog(log, `🔥 拉到 ${newKw.length} 個最新爆款：${newKw.slice(0,3).join("、")}...`);
-              sel.kwList = newKw;
-              sel.kwIndex = 0;
-              sel.kw = newKw[0];
-            } else {
-              selLog(log, "⚠️ 拉取爆款失敗，用原列表循環");
-              sel.kwIndex = 0;
-              sel.kw = kwList[0];
-            }
-          } catch(e) {
-            selLog(log, "⚠️ 拉取出錯，用原列表循環");
-            sel.kwIndex = 0;
-            sel.kw = kwList[0];
-          }
-          sel.page = 1; sel.pagesUsed = 0; sel.storesDone = 0;
-          sel.pendingCards = []; sel.visitedShops = []; sel.visitedShopIds = [];
-          sel.phase = "search"; sel.jumped = false; sel.refilteredCurrent = false;
-          sel.filtersApplied = false; sel.restartCount = 0; sel.emptyStep = 0;
-          saveSelectState(sel);
-          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, jitMs(8000));
-        },
-        onerror: () => {
-          sel.kwIndex = 0; sel.kw = kwList[0];
-          sel.page = 1; sel.pagesUsed = 0; sel.storesDone = 0;
-          sel.phase = "search"; saveSelectState(sel);
-          setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, jitMs(8000));
-        }
-      });
-    }
+    // v4.2.56 單機串行循環：所有關鍵詞跑完一輪後，回到第一個詞重新開始，無限循環。
+    // 空結果已有 SearchEmptyGuard 跳詞保護；真風控 /verify/ 仍在上游硬停（不會走到這裡）。
+    selLog(log, `\n🔄 一輪 ${kwList.length} 個詞已全部採完，回到第一個詞「${kwList[0]}」繼續循環採集`);
+    SearchEmptyGuard.reset(kwList[0]);
+    sel.kwIndex = 0;
+    sel.kw = kwList[0];
+    sel.page = 1;
+    sel.pagesUsed = 0;
+    sel.storesDone = 0;
+    sel.pendingCards = [];
+    sel.visitedShops = [];
+    sel.visitedShopIds = [];
+    sel.phase = "search";
+    sel.jumped = false;
+    sel.refilteredCurrent = false;
+    sel.filtersApplied = false;
+    sel.restartCount = 0;
+    sel.emptyStep = 0;
+    sel.emptyShops = 0;
+    sel.failedShops = [];
+    sel.shopFailStreak = 0;
+    saveSelectState(sel);
+    setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`; }, jitMs(3000));
+    return;
   }
 
   async function selectModeProductPhase(sel, log) {
@@ -2852,11 +2826,7 @@
 
   async function startSelectMode(log, mode) {
     // v4.2.45：調試指令輪詢已停用
-    // 每個任務開頭換一個新的標籤 ID：避免「複製標籤頁」把 sessionStorage 裡的舊 ID 一起帶過來，
-    // 導致多個標籤在後台顯示成同一個（後台只看到 1 個標籤、店鋪派工失效）。
-    // 每個任務開頭換一個新的標籤 ID：避免「複製標籤頁」把 sessionStorage 裡的舊 ID 一起帶過來，
-    // 導致多個標籤在後台顯示成同一個（後台只看到 1 個標籤、店鋪派工失效）。
-    Worker.reset();
+    // v4.2.56：去掉多標籤派詞——不再每次換 worker id，固定同一個 id（單機串行循環採集）。
     // 新選品任務隨後會跳轉搜索頁重新捕獲，先釋放舊任務殘留的捕獲包
     captured.items.length = 0;
     captured.shopBases.length = 0;
@@ -2868,18 +2838,10 @@
     if (/^https?:\/\//.test(kwRaw.trim())) kwRaw = "";
     // 參數模塊：價格/銷量/頁數/店鋪上限先從服務端 xuanpin_limits 模塊取一次（60 秒內快取）
     await Limits.load(log);
-    // 面板留空 → 向服務端領一個專屬關鍵詞（多標籤各領不同詞，見 xuanpin_workers）
-    if (!kwRaw.trim()) {
-      const claimed = await Worker.claim(log, "");
-      if (claimed) {
-        kwRaw = claimed;
-        const kwEl = document.querySelector(".sp-sel-kw");
-        if (kwEl) kwEl.value = claimed;
-      }
-    }
+    // v4.2.56：已移除服務端派詞/詞庫——關鍵詞只認面板手填（逗號分隔），不再向服務端領詞。
     // 解析多關鍵詞：支援逗號/頓號分隔
     const kwList = kwRaw.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean);
-    if (!kwList.length) { selLog(log, "❌ 請填寫搜索關鍵詞（或讓服務端派詞：面板留空、服務端詞庫非空）"); return false; }
+    if (!kwList.length) { selLog(log, "❌ 請在面板填寫搜索關鍵詞（多個用逗號分隔），已停用服務端派詞"); return false; }
     const kw = kwList[0];
     Worker.keyword = kw;
     Worker._count = 0;
