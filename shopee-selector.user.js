@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.60
+// @version      4.2.61
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -363,6 +363,26 @@
       return "";
     },
   };
+  // v4.2.61：从卡片容器原文稳健抓销量——台湾站卡片格式为「月銷量 18」「★4.9 月銷量 18」，
+  // 旧 parseCard 只认 a.innerText，销量文字常在 li 容器且夹在评分行，偶发误匹配成 1。
+  // 这里对整段容器文字做多种模式匹配，取合理的正销量值。
+  function robustCardSold(container) {
+    if (!container) return 0;
+    const t = (container.innerText || container.textContent || "").replace(/\u00a0/g, " ");
+    const pats = [
+      /月\s*銷\s*量\s*[:\s]*(\d[\d,.]*\s*[萬万千Kk]?)/i,
+      /月\s*銷\s*[:\s]*(\d[\d,.]*\s*[萬万千Kk]?)/i,
+      /月\s*销\s*量\s*[:\s]*(\d[\d,.]*\s*[萬万千Kk]?)/i,
+      /(\d[\d,.]*\s*[萬万千Kk]?)\s*月\s*銷/i,
+      /已\s*售(?:出)?\s*[:\s]*(\d[\d,.]*\s*[萬万千Kk]?)/i,
+    ];
+    for (const re of pats) {
+      const m = t.match(re);
+      if (m) { const n = parseCount(m[1]); if (n && n > 0) return n; }
+    }
+    return 0;
+  }
+
   // ===== MODULE: SearchCardPush 搜索頁合格卡片直接入庫 =====
   // 職責：把搜索頁已通過篩選的卡片打包成 ingest 需要的商品物件並推送。
   // 為什麼需要：進店後會按「搜什麼只採什麼」再卡一次關鍵詞，店鋪是全品類賣場，
@@ -392,16 +412,18 @@
     enabled() {
       return Limits.get("pushSearchCards") !== 0;
     },
-    build(parsed, apiItem) {
+    build(parsed, apiItem, container) {
+      // v4.2.61 销量四级兜底：API 字段 -> 稳健DOM容器抓取 -> 旧parsed解析 -> 0
+      const apiSold = apiItem ? pickSold(apiItem) : 0;
+      const domSold = robustCardSold(container);
+      const finalSold = apiSold || domSold || parsed.sold || parsed.historical_sold || 0;
       const it = {
         itemid: Number(parsed.itemid),
         shopid: Number(parsed.shopid) || (apiItem && Number(apiItem.shopid)) || null,
         name: parsed.name,
         price: parsed.price,
-        // v4.2.59 销量兜底：搜索页 DOM 卡片多无销量文字，必须靠 API item 的销量字段。
-        // 兼容 historical_sold / sold / historicalSales / sold_count 等多种命名与大小写。
-        sold: (apiItem && pickSold(apiItem)) || parsed.sold || parsed.historical_sold,
-        historical_sold: (apiItem && pickSold(apiItem)) || parsed.historical_sold || parsed.sold,
+        sold: finalSold,
+        historical_sold: finalSold,
         url: parsed.url,
         // v4.2.36：必須帶圖片，否則服務端「圖片 OCR 商標/水印」檢查無圖可查，帶商標商品會漏進庫
         image: parsed.image || (apiItem && apiItem.image) || "",
@@ -417,7 +439,7 @@
     async flush(cards, log, sourceTag) {
       const fresh = [];
       for (const c of cards || []) {
-        const it = this.build(c.parsed, c.apiItem);
+        const it = this.build(c.parsed, c.apiItem, c.container);
         if (!it.itemid || this._pushed.has(it.itemid)) continue;
         if (!it.name || it.price === null || it.price === undefined) continue;
         fresh.push(it);
@@ -2312,7 +2334,7 @@
         const reason = cardQualifiesSelect(container, apiItem, sel.minSold || 0, sel.maxSold || 0, sel.mode);
         if (reason) { selLog(log, `   跳過「${(parsed.name || "").slice(0, 14)}…」：${reason}`); continue; }
         pending.push(parsed.url);
-        qualifiedCards.push({ parsed, apiItem });
+        qualifiedCards.push({ parsed, apiItem, container });
         if (pending.length >= 40) break;
       } catch (_) {}
     }
@@ -2346,6 +2368,18 @@
     // 這些卡片已過：關鍵詞搜索結果、價格 200~1000、月銷、商城/優選徽標、品牌記憶、違禁類目；
     // 進店採集改為補充，不再作為唯一入庫來源。
     if (qualifiedCards.length && SearchCardPush.enabled()) {
+      if (!sel.soldDumpLogged) {
+        sel.soldDumpLogged = true;
+        try {
+          const samples = qualifiedCards.slice(0, 3).map((c) => {
+            const bi = SearchCardPush.build(c.parsed, c.apiItem, c.container);
+            return `${String(bi.name).slice(0,14)}|sold=${bi.sold}`;
+          }).join(" ; ");
+          const c0txt = (qualifiedCards[0].container && (qualifiedCards[0].container.innerText || "") || "").replace(/\n/g,"/").slice(0,120);
+          selLog(log, `🔬打包診斷: ${samples}`);
+          selLog(log, `🔬首卡原文: ${c0txt}`);
+        } catch (e) { selLog(log, `🔬打包診斷錯誤: ${e.message}`); }
+      }
       const n = await SearchCardPush.flush(qualifiedCards, log, sel.loc === "overseas" ? "海外" : "台灣");
       if (n) selLog(log, `📤 搜索頁卡片直接入庫：${n} 個（詞：${sel.kw || "-"}）`);
     }
