@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.62
+// @version      4.2.63
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -2206,13 +2206,14 @@
 
   function currentSearchPageParam() {
     const m = location.href.match(/[?&]page=(\d+)/);
-    return m ? Number(m[1]) : 1;
+    // v4.2.63：Shopee page 參數 0-based，無參＝第 1 頁＝索引 0。舊版返回 1 導致從第一頁往前時跳過首頁。
+    return m ? Number(m[1]) : 0;
   }
 
   async function selectModeSearchPhase(sel, log) {
     if (state.running === false) { selLog(log, "⏹ 已停止"); return; }
     sel.page = currentSearchPageParam();
-    selLog(log, `🔎 搜索頁第 ${sel.page} 頁，等待加載…`);
+    selLog(log, `🔎 搜索頁第 ${sel.page + 1} 頁，等待加載…`);
     // 空結果頁檢測（不等加載超時，直接看文案）
     const bodyNow = document.body ? document.body.innerText : "";
     const isEmptyPage = /找不到任何商品|找不到結果|找不到相關結果/.test(bodyNow);
@@ -2277,32 +2278,12 @@
       saveSelectState(sel);
       selLog(log, `📎 篩選後網址：${sel.searchUrl.slice(0, 120)}`);
     }
-    // 跳最後一頁（僅台灣模式）：像真人一樣連點「下一頁」按鈕直到最後頁
+    // v4.2.63：改為「從第 1 頁往前（往高頁）採」——月銷熱賣降序，第 1 頁才是高銷商品；
+    // 舊版 v4.2.50 跳到最後一頁採，專採月銷墊底貨（products=0 的結構性根因之一）。
     if (sel.mode === "tw" && !sel.jumped) {
-      const pg = findPagerInfo();
-      if (pg && pg.total > sel.minPage && pg.cur < pg.total) {
-        sel.jumped = true;
-        saveSelectState(sel);
-        // v4.2.50 [K] 不再逐頁點擊：實測會誤點「使用者」分頁跳到 /search_user，
-        // 之後在錯誤頁面連點 + 空等，最終撞 /verify/。改為一次網址跳轉到最後一頁。
-        sel.page = Math.min(pg.total, 100);
-        saveSelectState(sel);
-        const base = (sel.searchUrl && sel.searchUrl.indexOf("/search?") >= 0)
-          ? sel.searchUrl
-          : `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`;
-        selLog(log, `⏭ 共 ${pg.total} 頁，v4.2.50 直接以網址跳到第 ${sel.page} 頁（零逐頁點擊）`);
-        await humanSleep(1800);
-        location.href = withPage(base, sel.page - 1);   // Shopee page 參數 0-based
-        return;
-      } else if (pg && pg.total <= sel.minPage) {
-        sel.jumped = true;
-        selLog(log, `ℹ️ 篩選後僅 ${pg.total} 頁，未達頁碼下限 ${sel.minPage}，無深度頁可篩，結束`);
-        selectModeFinish(log);
-        return;
-      } else {
-        sel.jumped = true;
-        selLog(log, "ℹ️ 分頁資訊不足（單頁或解析失敗），從當前頁開始篩選");
-      }
+      sel.jumped = true;
+      saveSelectState(sel);
+      selLog(log, "ℹ️ v4.2.63 從第 1 頁（高銷）開始往後採，不再跳最後一頁");
     }
     await waitForCards(4, 60000);   // v4.2.48：抓取前最後確認卡片已渲染
     selLog(log, `   慢速滾動載入卡片（仿人工）…`);
@@ -2451,25 +2432,34 @@
     if (!state.running) { selLog(log, sel.paused ? "⏸ 已暫停，任務保留" : "⏹ 已停止"); return; }
     if (sel.storesDone >= sel.maxStores) { selectModeFinish(log); return; }
     if (sel.mode === "tw") {
-      // 台灣：第一輪篩完 → 刷新本頁再篩一次；第二輪沒新的 → 前一頁；到頁碼下限為止
+      // v4.2.63 台灣：從第 1 頁往後採（高銷優先）。第一輪篩完 → 刷新本頁再篩一次 → 下一頁；
+      // 到最後一頁 或 頁數上限(maxPages) 為止。sel.page 為 URL page 參數(0-based)。
       if (!sel.refilteredCurrent) {
         sel.refilteredCurrent = true;
         saveSelectState(sel);
-        selLog(log, `🔄 第 ${sel.page} 頁第一輪完成，刷新本頁再篩一次（抓新出現的賣場）`);
+        selLog(log, `🔄 第 ${sel.page + 1} 頁第一輪完成，刷新本頁再篩一次（抓新出現的賣場）`);
         await humanSleep(3200);
         location.href = withPage(sel.searchUrl || `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`, sel.page);
         return;
       }
-      if (sel.page - 1 < sel.minPage) {
-        selLog(log, `⏭ 已到頁碼下限（第 ${sel.minPage} 頁），1~${sel.minPage} 頁跳過，選品結束`);
+      const pgInfo = findPagerInfo();
+      const lastPageIdx = pgInfo ? pgInfo.total - 1 : sel.page;   // 0-based 末頁索引
+      if (sel.page >= lastPageIdx) {
+        selLog(log, `✅ 已採到最後一頁（第 ${lastPageIdx + 1} 頁），台灣選品結束`);
         selectModeFinish(log);
         return;
       }
-      sel.page -= 1;
+      if (sel.pagesUsed >= sel.maxPages) {
+        selLog(log, `✅ 已採集 ${sel.maxPages} 頁（頁數上限），台灣選品結束`);
+        selectModeFinish(log);
+        return;
+      }
+      sel.page += 1;   // 下一頁（往高頁，高銷→低銷）
+      sel.pagesUsed += 1;
       sel.refilteredCurrent = false;
       sel.phase = "search";
       saveSelectState(sel);
-      selLog(log, `⬅️ 前進到第 ${sel.page} 頁，開始篩選賣場`);
+      selLog(log, `➡️ 前進到第 ${sel.page + 1} 頁，開始篩選賣場`);
       await humanSleep(3500);
       location.href = withPage(sel.searchUrl || `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`, sel.page);
       return;
@@ -3031,7 +3021,7 @@
       sel.minPage = sel.minPage || 5;
       sel.maxPages = sel.maxPages || Limits.get("pageMax") || 30;
       sel.pagesUsed = sel.pagesUsed || 0;
-      sel.page = sel.page || 1;
+      sel.page = Number.isFinite(sel.page) ? sel.page : 0;   // v4.2.63：0-based，0=第1頁（不能用 || 1，0 是第一頁）
       sel.storesDone = sel.storesDone || 0;
       sel.pendingCards = sel.pendingCards || [];
       if (sel.paused) {
