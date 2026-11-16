@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.63
+// @version      4.2.64
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -2477,8 +2477,50 @@
     location.href = withPage(sel.searchUrl || `https://shopee.tw/search?keyword=${encodeURIComponent(sel.kw)}`, sel.page);
   }
 
-  function selectModeFinish(log) {
+  async function selectModeFinish(log) {
     const sel = loadSelectState();
+
+    // v4.2.64 派詞模式：採完一個詞 → 歸還租約（該詞進冷卻池＝「採一個刪一個」）
+    // → 立刻向服務端領下一個詞（fresh 用完自動回收 stale／人工詞庫空則從爆品提煉＝「沒詞了再加」）。
+    // 領不到詞時才真正結束本輪任務。面板手填詞（dispatched=false）走原有本地循環，不受影響。
+    if (sel && sel.dispatched) {
+      selLog(log, `\n🔓 關鍵詞「${sel.kw}」採集完畢，歸還租約（進 3 天冷卻池）`);
+      try { await Worker.release(log); } catch (_) { /* 釋放失敗等租約到期自動回收 */ }
+      const nextKw = await Worker.claim(log, "");
+      if (!nextKw) {
+        selLog(log, "🛑 服務端詞庫暫無可派詞（全部在冷卻期），本輪暫停；稍後冷卻到期或詞庫更新可重新啟動");
+        discardSelectTask();
+        if (typeof state !== "undefined") state.running = false;
+        try { toggleRunning(); } catch (_) { /* 無開關時忽略 */ }
+        setStatus("選品模式：詞庫冷卻中暫停");
+        return;
+      }
+      SearchEmptyGuard.reset(nextKw);
+      sel.kw = nextKw;
+      sel.kwList = [nextKw];
+      sel.kwIndex = 0;
+      sel.page = 1;
+      sel.pagesUsed = 0;
+      sel.storesDone = 0;
+      sel.pendingCards = [];
+      sel.visitedShops = [];
+      sel.visitedShopIds = [];
+      sel.phase = "search";
+      sel.jumped = false;
+      sel.refilteredCurrent = false;
+      sel.filtersApplied = false;
+      sel.restartCount = 0;
+      sel.emptyStep = 0;
+      sel.emptyShops = 0;
+      sel.failedShops = [];
+      sel.shopFailStreak = 0;
+      Worker.keyword = nextKw;
+      Worker._count = 0;
+      saveSelectState(sel);
+      setTimeout(() => { location.href = `https://shopee.tw/search?keyword=${encodeURIComponent(nextKw)}`; }, jitMs(3000));
+      return;
+    }
+
     const kwList = (sel && sel.kwList) || [sel ? sel.kw : ""];
     const kwIndex = (sel && sel.kwIndex) || 0;
     if (kwIndex + 1 < kwList.length) {
@@ -2918,15 +2960,28 @@
     if (/^https?:\/\//.test(kwRaw.trim())) kwRaw = "";
     // 參數模塊：價格/銷量/頁數/店鋪上限先從服務端 xuanpin_limits 模塊取一次（60 秒內快取）
     await Limits.load(log);
-    // v4.2.56：已移除服務端派詞/詞庫——關鍵詞只認面板手填（逗號分隔），不再向服務端領詞。
-    // 解析多關鍵詞：支援逗號/頓號分隔
+    // v4.2.64：恢復服務端派詞（詞庫在 VM）。面板留空→向服務端領一個詞（採完歸還進冷卻池＝「採一個刪一個」，
+    // 詞庫 fresh 用完會自動回收 stale、人工詞庫空則從爆品提煉＝「沒詞了再加」）；面板填了詞→沿用舊行為（逗號分隔循環）。
+    let dispatched = false;   // 是否為服務端派詞模式（影響換詞邏輯：派詞模式每次採完重新領）
+    if (!kwRaw.trim()) {
+      const claimed = await Worker.claim(log, "");
+      if (claimed) {
+        kwRaw = claimed;
+        dispatched = true;
+        // 不回填輸入框：避免 input 事件把領到的詞寫進 sp_sel_kw，導致下次點開始變成手填模式。
+        // 當前詞由 state.kw + 日誌顯示；面板留空才能在每次重新啟動時都從服務端領新詞。
+      } else {
+        selLog(log, "❌ 服務端詞庫無可用詞，且面板未填關鍵詞"); return false;
+      }
+    }
+    // 解析多關鍵詞：支援逗號/頓號分隔（派詞模式只有 1 個詞）
     const kwList = kwRaw.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean);
-    if (!kwList.length) { selLog(log, "❌ 請在面板填寫搜索關鍵詞（多個用逗號分隔），已停用服務端派詞"); return false; }
+    if (!kwList.length) { selLog(log, "❌ 請在面板填寫搜索關鍵詞（或留空由服務端派詞）"); return false; }
     const kw = kwList[0];
     Worker.keyword = kw;
     Worker._count = 0;
     Worker.startHeartbeat(60000);
-    selLog(log, `📋 共 ${kwList.length} 個關鍵詞：${kwList.join("、")}（Worker ${Worker.id()}）`);
+    selLog(log, `📋 ${dispatched ? "服務端派詞" : "面板詞"}：共 ${kwList.length} 個關鍵詞：${kwList.join("、")}（Worker ${Worker.id()}）`);
     // 面板填了就用面板值；留空（或 0）＝用參數模塊 xuanpin_limits / 上次記憶
     const inputNum = (cls, fallback) => {
       const el = document.querySelector(cls);
@@ -2948,7 +3003,9 @@
     const maxPages = Math.max(1, Math.min(Limits.get("pageHardMax"), inputNum(".sp-sel-pages", Limits.get("pageMax") || selGet("maxPages", 30))));
     const loc = mode === "os" ? "overseas" : "tw";
     if (!kw.trim()) { selLog(log, "❌ 請填寫搜索關鍵詞"); return false; }
-    tabStore.setItem("sp_sel_kw", kw.trim());
+    // v4.2.64：派詞模式保持面板記憶為空，確保下次點「開始」仍走服務端派詞；手填模式照舊記憶。
+    if (dispatched) tabStore.removeItem("sp_sel_kw");
+    else tabStore.setItem("sp_sel_kw", kw.trim());
     tabStore.setItem("sp_sel_min", String(min));
     tabStore.setItem("sp_sel_maxPrice", String(maxPrice));
     tabStore.setItem("sp_sel_minSold", String(minSold));
@@ -2992,7 +3049,7 @@
     ensureBrandMemoryLoaded();
     selLog(log, `🏷️ 品牌記憶：共 ${brandMemoryIds.size} 個品牌商品，本次合併新增 ${brandNew} 個`);
     try {
-      const state = { kw: kw, kwList: kwList, kwIndex: 0, min, maxPrice, minSold, maxSold, maxStores, minPage, maxPages, loc, mode, page: 1, pagesUsed: 0, pendingCards: [], visitedShops: [], visitedShopIds: [], storesDone: 0, phase: "search", refilteredCurrent: false, autoExpand: false };
+      const state = { kw: kw, kwList: kwList, kwIndex: 0, dispatched: dispatched, min, maxPrice, minSold, maxSold, maxStores, minPage, maxPages, loc, mode, page: 1, pagesUsed: 0, pendingCards: [], visitedShops: [], visitedShopIds: [], storesDone: 0, phase: "search", refilteredCurrent: false, autoExpand: false };
       saveSelectState(state);
       tabStore.setItem(SELECT_FLAG, "1");
       state.running = true;
