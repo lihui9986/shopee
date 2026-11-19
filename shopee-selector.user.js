@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         蝦皮選品器（台灣/海外雙選品）
 // @namespace    shopee-crawler
-// @version      4.2.64
+// @version      4.2.65
 // @description  支持局域網/穿透地址回傳（GM 特權請求繞過混合內容限制）；按週期自動補抓；每店單獨條件；抓當前店鋪實時拉取工作台條件；選品模式（關鍵詞→搜索篩選→最後頁向前→自動進店採集）；品牌記憶；內建 4181 採集監控心跳；採集內存優化；心跳 idle 以本頁壽命為上限；看門狗進化；選品價格過濾 fail-closed；打轉死循環修復；後台休眠不誤報卡住；前台白屏 60 秒自動刷新；fetch 鉤子容錯；v4.2.13 過濾模塊化重構：標題合法性/關鍵詞相關/價格/銷量/總銷/店鋪類型/配送拆為單一職責模塊，唯一編排入口 qualifyItem（改一處不漏一處）；進店採集按當前關鍵詞過濾（搜什麼只採什麼）；拒全空數據（無銷量無評分行不採）；關閉自動擴詞（不採用戶沒填的爆款詞）；mergeItem 防麵包屑標題覆蓋真標題；v4.2.14 全腳本模塊化重構（Meta/NetCapture/Parse/Filter/Memory/SelectFSM/LoopGuard/Watchdog/Heartbeat/SyncMode 單一職責、互不干擾）；新增 SearchEmptyGuard（搜索連續 0 結果自動跳詞，根治空轉假採集中）與 ProduceReporter（產出計數上報）；配套 monitor.py ZeroProduceGuard（running 超時無產出→warning）；v4.2.15 進店取店名 DOM 兜底（Shopee 接口改路徑/無捕獲時用店鋪頁 URL slug 與頁面標題取店名，根治「沒拿到賣場名稱」全店跳過之零採集）；v4.2.16 移除 Watchdog 自動恢復與內建 4181 心跳監控（ProduceReporter）；v4.2.17 停止/任務自然跑完即徹底丟棄選品任務緩存（不續跑、不殘留 failedShops，下次開始必為全新任務）；v4.2.18 進店前校驗「查看賣場」連結（空/#/首頁視為失效，跳過換下一商品，不再跳首頁把站名當店鋪採）＋兜底取店名拒絕站點名「Shopee蝦皮購物」；v4.2.19 滾動增量入庫（海外模式每滾一輪立即推送該輪合格商品，斷線/崩潰只丟最後一輪，不再整店白採；推送失敗自動下輪重試；台灣模式保持整店推送因有快速到貨徽標過濾）＋空店快速止損（首屏≥8 商品全無相關直接跳店，省掉掃全店時間）
 // @match        https://shopee.tw/*
 // @run-at       document-start
@@ -471,7 +471,7 @@
   const Limits = {
     data: null,
     _loadedAt: 0,
-    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 30, pageHardMax: 200, storeMax: 0, skipPreferredShop: 0, pushSearchCards: 1 },
+    defaults: { priceMin: 200, priceMax: 1000, soldMin: 5, soldMax: 0, histSoldMin: 1, pageMin: 1, pageMax: 30, pageHardMax: 200, storeMax: 0, skipPreferredShop: 0, pushSearchCards: 1, coldPageLimit: 3 },
     async load(log) {
       if (this.data && Date.now() - this._loadedAt < 60000) return this.data;
       try {
@@ -483,6 +483,7 @@
           pageMin: Number(r.pageMin), pageMax: Number(r.pageMax),
           pageHardMax: Number(r.pageHardMax), storeMax: Number(r.storeMax),
           skipPreferredShop: Number(r.skipPreferredShop) || 0,
+          coldPageLimit: Number(r.coldPageLimit) > 0 ? Number(r.coldPageLimit) : 3,
         });
         this._loadedAt = Date.now();
         if (log) log(`⚙️ 參數模塊已載入：價格 ${this.data.priceMin}~${this.data.priceMax}｜月銷 ≥${this.data.soldMin}${this.data.soldMax ? " ≤" + this.data.soldMax : ""}｜總銷 ≥${this.data.histSoldMin}｜頁數 ${this.data.pageMin}~${this.data.pageMax}｜店鋪 ≤${this.data.storeMax}`);
@@ -2392,9 +2393,10 @@
         }
         selLog(log, "❌ 連續 2 次刷新仍無原始商品，交回原空頁流程");
       }
-      // ★ SearchEmptyGuard：本頁 0 合格商品，累計空頁；連續超限則跳過該關鍵詞（防空轉）
-      if (SearchEmptyGuard.onEmptyPage(sel.kw)) {
-        selLog(log, `⏭ 關鍵詞「${sel.kw}」連續 ${SearchEmptyGuard.LIMIT} 頁 0 合格商品，跳過該詞（防空轉）`);
+      // ★ SearchEmptyGuard：本頁 0 合格商品，累計冷頁；連續超限則跳過該關鍵詞（防空轉）
+      // v4.2.65：傳入 sel.page 按頁去重（同頁刷新再篩只計一次）；抓取失敗頁已在上游 reset 不計。
+      if (SearchEmptyGuard.onEmptyPage(sel.kw, sel.page)) {
+        selLog(log, `⏭ 關鍵詞「${sel.kw}」連續 ${SearchEmptyGuard.LIMIT} 頁 0 合格商品（非熱銷），跳過該詞（防空轉）`);
         SearchEmptyGuard.reset(sel.kw);
         selectModeFinish(log);
         return;
@@ -2403,6 +2405,7 @@
       return;
     }
     sel.captureRetry = 0;   // v4.2.45：本頁成功取到商品，清零擷取失敗重試計數
+    SearchEmptyGuard.onNonEmptyPage(sel.kw);   // v4.2.65：本頁有合格商品 → 該詞還有貨，清零冷頁計數
     sel.pendingCards = pending;
     sel.phase = "product";
     saveSelectState(sel);
@@ -2412,19 +2415,50 @@
   }
   // ===== MODULE 7: SearchEmptyGuard 搜索空結果保護（獨立·不依賴其他模塊內部狀態） =====
   // 職責：某關鍵詞連續 N 頁搜不到任何合格商品 → 觸發跳詞，避免腳本在 search 階段空轉（假採集中）
-  // 接口：onEmptyPage(kw) 返回 true=應跳詞；reset(kw)；LIMIT 閾值
+  // 接口：onEmptyPage(kw, page) 返回 true=應跳詞；onNonEmptyPage(kw) 有貨清零；reset(kw)；LIMIT 閾值
+  // v4.2.65：計數從內存改為持久化到 sessionStorage —— 翻頁靠 location.href 整頁導航、
+  //   腳本每次重跑內存變量即清零，「連續 N 頁」永遠湊不滿，冷詞一路翻到末頁空轉（根因）。
+  //   同時按頁碼去重（台灣模式每頁「刷新再篩一次」會篩兩遍，同頁只計一次），閾值由服務端 coldPageLimit 下發。
   const SearchEmptyGuard = (function () {
-    const LIMIT = 3;                 // 連續 3 頁 0 合格商品即跳過該關鍵詞
-    const emptyCount = {};
+    const STORE_KEY = "sp_cold_page_v1";
+    function _read() {
+      try { return JSON.parse(tabStore.getItem(STORE_KEY) || "{}") || {}; } catch (_) { return {}; }
+    }
+    function _write(o) {
+      try { tabStore.setItem(STORE_KEY, JSON.stringify(o)); } catch (_) {}
+    }
+    function _limit() {
+      const n = Number(Limits.get("coldPageLimit"));
+      return Number.isFinite(n) && n > 0 ? n : 3;
+    }
     return {
-      LIMIT: LIMIT,
-      onEmptyPage(kw) {
+      get LIMIT() { return _limit(); },   // 向後兼容 .LIMIT 用法，改為動態讀服務端閾值
+      onEmptyPage(kw, page) {
         if (!kw) return false;
-        emptyCount[kw] = (emptyCount[kw] || 0) + 1;
-        return emptyCount[kw] >= LIMIT;
+        const o = _read();
+        const rec = o[kw] || { count: 0, lastPage: null };
+        // 同一頁只計一次（同頁刷新再篩一遍不重複累加）
+        if (page !== undefined && page !== null && rec.lastPage === page) {
+          return rec.count >= _limit();
+        }
+        rec.count = (rec.count || 0) + 1;
+        if (page !== undefined && page !== null) rec.lastPage = page;
+        o[kw] = rec;
+        _write(o);
+        return rec.count >= _limit();
       },
-      reset(kw) { if (kw) emptyCount[kw] = 0; },
-      clear() { for (const k in emptyCount) delete emptyCount[k]; }
+      onNonEmptyPage(kw) {   // 本頁篩到合格商品 → 該詞還有貨，清零冷頁計數重新計
+        if (!kw) return;
+        const o = _read();
+        if (o[kw]) { o[kw] = { count: 0, lastPage: null }; _write(o); }
+      },
+      reset(kw) {
+        if (!kw) return;
+        const o = _read();
+        delete o[kw];
+        _write(o);
+      },
+      clear() { try { tabStore.removeItem(STORE_KEY); } catch (_) {} }
     };
   })();
 
